@@ -8,7 +8,7 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    llama_server_url: str = "http://127.0.0.1:8081"
+    llama_server_url: str = "http://localhost:8081"
     mcp_server_url: str = "http://localhost:8000/mcp"
 
     app_host: str = "localhost"
@@ -31,6 +31,9 @@ class Settings(BaseSettings):
 
     # MCP tool use
     mcp_enabled: bool = True
+
+    # Hugging Face token (used by sentence-transformers / huggingface_hub)
+    hf_token: str = ""
 
     # Microsoft Entra authentication
     entra_auth_enabled: bool = False

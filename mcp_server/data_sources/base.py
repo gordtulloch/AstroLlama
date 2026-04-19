@@ -16,12 +16,6 @@ import numpy as np
 class BaseDataSource:
     """
     Base class for astronomical data sources with unified file management.
-    
-    Provides common functionality for:
-    - File saving and organization
-    - Registry management
-    - Metadata tracking
-    - Error handling
     """
     
     def __init__(self, base_dir: str = None, source_name: str = "unknown"):

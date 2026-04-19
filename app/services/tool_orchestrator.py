@@ -142,27 +142,25 @@ async def run_chat(
     #     system prompt. We never mutate the stored history. ----------------
     llm_messages = list(history)  # shallow copy — safe to modify positions
 
-    # When tools are active, remind the model to prefer its own knowledge
-    # and only call a tool when live/catalogue data is genuinely needed.
+    # When tools are active, remind the model how to route tool calls correctly.
     if tools and llm_messages and llm_messages[0].get("role") == "system":
-        llm_messages[0] = {
-            **llm_messages[0],
-            "content": llm_messages[0]["content"] + (
-                "\n\nYou have access to astronomical database tools. "
-                "TOOL USE RULES (follow strictly):\n"
-                "- NEVER call a tool for general knowledge questions such as: "
-                "brightest stars, planet names, constellation facts, famous objects, "
-                "astronomical rankings, or anything you already know from training.\n"
-                "- ONLY call a tool when the user explicitly asks for a live catalogue query, "
-                "specific survey data (e.g. DESI spectra, redshifts), or real-time observational data.\n"
-                "- If you can answer from your own knowledge, do so immediately without calling any tool.\n"
-                "TOOL ROUTING RULES (mandatory):\n"
-                "- For ANY query involving: star names, constellation regions, magnitude/brightness limits, "
-                "object type lookups by name (e.g. 'stars in Orion', 'bright stars', 'stars brighter than mag 3') "
-                "→ use astroquery_query with service_name='simbad'. "
-                "SIMBAD has magnitude data (FLUX_V) and understands constellation/object names directly.\n"
-            ),
-        }
+        tool_names = [t["function"]["name"] for t in tools]
+        simbad_hint = (
+            "\n\nTOOL ROUTING RULES (follow strictly):\n"
+            "- Use the simbad_search tool for ANY query about: stars, galaxies, nebulae, "
+            "clusters, or other celestial objects — including lists of the brightest/nearest/largest, "
+            "objects in a constellation, or objects of a specific type. "
+            "Pass the user's question as-is in the 'query' parameter.\n"
+            "- Do NOT call a tool more than once for the same question. "
+            "If a tool returns results, present them directly to the user without calling the tool again.\n"
+            "- Only call get_weather or get_latlong for weather or location queries.\n"
+            "- Only call get_current_time when the user asks for the current time.\n"
+        ) if "simbad_search" in tool_names else ""
+        if simbad_hint:
+            llm_messages[0] = {
+                **llm_messages[0],
+                "content": llm_messages[0]["content"] + simbad_hint,
+            }
 
     if retriever and retriever.available and retriever.document_count > 0:
         user_msgs = [m for m in history if m.get("role") == "user"]
@@ -222,13 +220,13 @@ async def run_chat(
                     idx: int = tc_delta.get("index", 0)
                     if idx not in tool_calls_acc:
                         tool_calls_acc[idx] = {
-                            "id": "",
+                            "id": f"call_{uuid.uuid4().hex[:8]}",  # fallback if server omits id
                             "type": "function",
                             "function": {"name": "", "arguments": ""},
                         }
                     entry = tool_calls_acc[idx]
                     if tc_delta.get("id"):
-                        entry["id"] = tc_delta["id"]
+                        entry["id"] = tc_delta["id"]  # prefer server-supplied id
                     func_delta = tc_delta.get("function") or {}
                     if func_delta.get("name"):
                         entry["function"]["name"] += func_delta["name"]
@@ -279,7 +277,9 @@ async def run_chat(
             try:
                 raw_result = await mcp_client.call_tool(name, args)
                 result_str = _serialize_tool_result(raw_result)
-                logger.info("Tool result ← %s  (%d chars)", name, len(result_str))
+                logger.info("Tool result ← %s  (%d chars)\n%s",
+                            name, len(result_str),
+                            result_str[:1000] + ("..." if len(result_str) > 1000 else ""))
 
                 if len(result_str) > _LARGE_RESULT_THRESHOLD:
                     filename, url = _save_large_result(name, result_str)

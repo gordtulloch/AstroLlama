@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 
 """
-MCP Server
+AstroLlamaMCP Server
 """
 
 import asyncio
 import logging
 import argparse
-from typing import Any, Dict, List
+from typing import Any
 import json
 
 import httpx
@@ -19,61 +19,12 @@ from mcp.server.models import InitializationOptions
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from pydantic import AnyUrl
 
-# Import modular components
-from data_sources import AstroqueryUniversal
-
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Initialize server
 server = Server("mcp-server")
-
-class AstroMCPServer:
-    """
-    Unified Astronomical MCP Server with modular data source architecture.
-    
-    This server provides a single interface to multiple astronomical datasets
-    with consistent file management, data preview, and analysis capabilities.
-    
-    Architecture:
-    =============
-    - Data Sources: Modular classes for each astronomical dataset
-    - I/O Module: Unified file preview and management
-    - Tools Module: Analysis and calculation tools (future expansion)
-    - Utils Module: Common utilities and helpers (future expansion)
-    
-    """
-    
-    def __init__(self, base_dir: str = None):
-        """
-        Initialize the modular astronomical MCP server.
-        
-        Args:
-            base_dir: Base directory for file storage (shared across all data sources)
-        """
-        self.base_dir = base_dir
-        
-        # Initialize data sources
-        self.astroquery = AstroqueryUniversal(base_dir=base_dir)
-        
-        logger.info("MCP Server initialized with modular architecture")
-        logger.info(f"Astroquery services available: {len(self.astroquery.list_services())}")
-
-    def list_astroquery_services(self) -> List[Dict[str, Any]]:
-        """List all available astroquery services."""
-        return self.astroquery.list_services()
-    
-    def get_astroquery_service_details(self, service_name: str) -> Dict[str, Any]:
-        """Get detailed information about a specific astroquery service."""
-        return self.astroquery.get_service_details(service_name)
-    
-    def search_astroquery_services(self, **criteria) -> List[str]:
-        """Search astroquery services by various criteria."""
-        return self.astroquery.search_services(**criteria)
-    
-# Initialize server
-astro_server = AstroMCPServer()
 
 @server.list_resources()
 async def handle_list_resources() -> list[types.Resource]:
@@ -83,8 +34,8 @@ async def handle_list_resources() -> list[types.Resource]:
     return [
         types.Resource(
             uri="astro://help/overview",
-            name="Astro MCP Server Help",
-            description="Overview of astronomical data access through modular MCP server",
+            name="AstroLlama MCP Server Help",
+            description="Overview of astronomical data access through the AstroLlama MCP server",
             mimeType="text/plain"
         ),
         types.Resource(
@@ -108,20 +59,16 @@ async def handle_read_resource(uri: AnyUrl) -> str:
     
     if path == "help/overview":
         return """
-MCP Server - Data Access
+AstroLlama MCP Server - Data Access
 ========================
 """
     
     elif path == "info/data_sources":
-
-        astroquery_status = f"✅ Available ({len(astro_server.astroquery._services)} services discovered)"
-        
-        return f"""
+        return """
 Astronomical Data Sources Status
 ===============================
 
-Astroquery Services
-- Status: {astroquery_status}
+No data sources currently configured.
 """
     
     else:
@@ -166,101 +113,22 @@ async def handle_list_tools() -> list[types.Tool]:
             }
         ),
         types.Tool(
-            name="list_astroquery_services",
-            description="List all available astroquery services discovered by the server",
-            inputSchema={"type": "object", "properties": {}}
-        ),
-        types.Tool(
-            name="get_astroquery_service_details",
-            description="Get detailed information about a specific astroquery service including capabilities, data types, and example queries",
+            name="simbad_search",
+            description="Search the SIMBAD astronomical database for stars, nebulae, galaxies, clusters, and other celestial objects. Supports natural-language queries such as 'List the 10 brightest stars in the sky', 'Emission nebulae in Orion', or 'Globular clusters in Sagittarius'. Results are formatted for non-scientists with common names where available. If no limit is specified, returns up to 10 results.",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "service_name": {"type": "string", "description": "Name of the astroquery service (e.g., 'simbad', 'vizier', 'gaia')"}
-                },
-                "required": ["service_name"]
-            }
-        ),
-        types.Tool(
-            name="search_astroquery_services",
-            description=(
-                "Search for an astroquery service name when you do NOT already know it. "
-                "DO NOT call this for standard star, object, or constellation queries — "
-                "for those, call astroquery_query directly with service_name='simbad'. "
-                "Use this ONLY when you need to discover which service handles an "
-                "unfamiliar data type (e.g. radio continuum surveys, X-ray catalogues)."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "data_type": {"type": "string", "description": "Filter by data type (e.g. 'spectra', 'images', 'photometry')"},
-                    "wavelength": {"type": "string", "description": "Filter by wavelength coverage (e.g. 'optical', 'radio', 'infrared', 'x-ray')"},
-                    "object_type": {"type": "string", "description": "Filter by object type (e.g. 'galaxies', 'quasars')"}
-                },
-                "additionalProperties": False
-            }
-        ),
-        types.Tool(
-            name="astroquery_query",
-            description=(
-                "Perform a query against any ASTRONOMICAL astroquery service (e.g. simbad, vizier, gaia, mast, ned). "
-                "DO NOT use this for weather, time, or geocoding — use get_weather, get_current_time, or get_latlong instead. "
-                "\n\n"
-                "FOR CONSTELLATION / MAGNITUDE QUERIES (e.g. 'stars in Orion brighter than magnitude 5'):\n"
-                "  Call THIS tool directly — do NOT call search_astroquery_services or get_astroquery_service_details first.\n"
-                "  Use service_name='simbad', query_type='query_region', object_name='Ori', "
-                "radius=12 (Orion spans ~20 deg — use 10-15), vmag_max=5.\n"
-                "  Do NOT also pass ra/dec when using object_name — pick one or the other.\n"
-                "  Do NOT pass data_type, wavelength, magnitude, capability, requires_auth, "
-                "or other non-SIMBAD parameters.\n\n"
-                "  Alternatively use query_type='query_criteria' with "
-                "criteria=\"region(Circle, Ori, 12d) & Vmag <= 5\".\n\n"
-                "Call 'get_astroquery_service_details' only when you need to explore an unfamiliar service."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "service_name": {
+                    "query": {
                         "type": "string",
-                        "description": "The astroquery service to use (e.g., 'simbad', 'vizier', 'mast', 'gaia')."
+                        "description": "Natural-language search query, e.g. 'List the 10 brightest stars', 'Emission nebulae in Orion', 'Globular clusters in Sagittarius'"
                     },
-                    "query_type": {
-                        "type": "string",
-                        "description": "Query method: 'query_object' (single named object), 'query_region' (cone search by name or RA/Dec), 'query_criteria' (SIMBAD constraint language). Defaults to 'auto'.",
-                        "default": "auto"
-                    },
-                    "auto_save": {
-                        "type": "boolean",
-                        "description": "Automatically save tabular results to a file.",
-                        "default": True
-                    },
-                    "object_name": {
-                        "type": "string",
-                        "description": "Named object or constellation for the search centre (e.g. 'Ori', 'M42', 'Betelgeuse'). Use this OR ra+dec, not both."
-                    },
-                    "ra": {
-                        "type": "number",
-                        "description": "Right Ascension in decimal degrees (0-360). Use this with dec instead of object_name when you have explicit coordinates."
-                    },
-                    "dec": {
-                        "type": "number",
-                        "description": "Declination in decimal degrees (-90 to +90). Use with ra."
-                    },
-                    "radius": {
-                        "type": "number",
-                        "description": "Search radius in decimal degrees. Orion spans ~20 deg — use 10-15. Default 0.1 is far too small for constellation searches."
-                    },
-                    "vmag_max": {
-                        "type": "number",
-                        "description": "SIMBAD only: keep only objects with V-magnitude <= this value. Use this for magnitude-limited star queries (e.g. vmag_max=5 for mag 5 or brighter)."
-                    },
-                    "criteria": {
-                        "type": "string",
-                        "description": "SIMBAD query_criteria string, e.g. \"region(Circle, Ori, 12d) & Vmag <= 5\". Use with query_type='query_criteria'."
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of results to return (default: 10, max: 100). Overridden if a number is mentioned in the query.",
+                        "default": 10
                     }
                 },
-                "required": ["service_name"],
-                "additionalProperties": False
+                "required": ["query"]
             }
         ),
         types.Tool(
@@ -291,7 +159,15 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
     """
     
     try:
-        if name == "get_weather":
+        if name == "simbad_search":
+            try:
+                from .data_sources.simbad_search import simbad_search
+            except ImportError:
+                from data_sources.simbad_search import simbad_search
+            result = await simbad_search(**arguments)
+            return [types.TextContent(type="text", text=result)]
+
+        elif name == "get_weather":
             result = await _fetch_open_meteo_weather(**arguments)
             return [types.TextContent(type="text", text=result)]
 
@@ -303,144 +179,6 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
             result = await _get_current_time(**arguments)
             return [types.TextContent(type="text", text=result)]
 
-        elif name == "list_astroquery_services":
-            services = astro_server.list_astroquery_services()
-            
-            if not services:
-                return [types.TextContent(type="text", text="No astroquery services found.")]
-            
-            response = "Available Astroquery Services:\n"
-            response += "==============================\n\n"
-            for service in services:
-                response += f"- {service['full_name']} (service name: '{service['service']}')\n"
-                response += f"  Description: {service['description']}\n\n"
-            
-            response += "Use `get_astroquery_service_details` with a service name for more information."
-            return [types.TextContent(type="text", text=response)]
-        
-        elif name == "get_astroquery_service_details":
-            service_name = arguments["service_name"]
-            details = astro_server.get_astroquery_service_details(service_name)
-
-            if not details:
-                return [types.TextContent(type="text", text=f"Service '{service_name}' not found.")]
-
-            response = f"Details for: {details['full_name']} (service: '{details['service']}')\n"
-            response += "=" * (len(response) - 1) + "\n\n"
-            response += f"Description: {details['description']}\n\n"
-            
-            response += "Capabilities:\n"
-            for cap in details['capabilities']:
-                response += f"- {cap}\n"
-            response += "\n"
-
-            response += "Data Types:\n"
-            for dt in details['data_types']:
-                response += f"- {dt}\n"
-            response += "\n"
-
-            response += "Wavelength Coverage:\n"
-            # Handle the case where wavelength_coverage might be a string or list
-            wavelength_coverage = details['wavelength_coverage']
-            if isinstance(wavelength_coverage, list):
-                for wl in wavelength_coverage:
-                    response += f"- {wl}\n"
-            else:
-                response += f"- {wavelength_coverage}\n"
-            response += "\n"
-
-            if details['example_queries']:
-                response += "Example Queries:\n"
-                for i, ex in enumerate(details['example_queries'], 1):
-                    response += f"{i}. {ex['description']}\n"
-                    response += f"   `{ex['query']}`\n"
-            
-            return [types.TextContent(type="text", text=response)]
-        
-        elif name == "search_astroquery_services":
-            criteria = {k: v for k, v in arguments.items() if k != "service_name"}
-            services = astro_server.search_astroquery_services(**criteria)
-            
-            if not services:
-                return [types.TextContent(type="text", text="No matching services found.")]
-            
-            response = "Found services matching your criteria:\n\n"
-            for service in services:
-                response += f"- {service['full_name']} ({service['service']}) - Score: {service['score']}\n"
-                response += f"  Description: {service['description']}\n"
-                response += f"  Reasons: {', '.join(service['reasons'])}\n\n"
-            
-            return [types.TextContent(type="text", text=response)]
-        
-        elif name == "astroquery_query":
-            # Guard: redirect clearly misrouted calls
-            service = arguments.get('service_name', '').lower()
-            non_astroquery = {
-                'weather': 'get_weather',
-                'time': 'get_current_time',
-                'latlong': 'get_latlong',
-                'geocoding': 'get_latlong',
-            }
-            if service in non_astroquery:
-                return [types.TextContent(
-                    type="text",
-                    text=f"'{service}' is not an astroquery service. Use the '{non_astroquery[service]}' tool instead."
-                )]
-
-            # Backward compatibility: user might still use 'object'
-            if 'object' in arguments and 'object_name' not in arguments:
-                arguments['object_name'] = arguments.pop('object')
-
-            result = astro_server.astroquery.universal_query(**arguments)
-            
-            if result['status'] in ['error', 'auth_required']:
-                # The help text is already pre-formatted
-                return [types.TextContent(type="text", text=result['help'])]
-
-            # Success case — always return inline data so the LLM can answer directly
-            response = f"Successfully executed '{result['query_type']}' on '{result['service']}'.\n"
-            response += f"Found {result['num_results']} results.\n\n"
-
-            results_data = result['results']
-            if isinstance(results_data, list) and len(results_data) > 0:
-                # Sort by V magnitude ascending (brightest first) when available
-                vmag_key = next((k for k in results_data[0] if k.upper() == 'FLUX_V'), None)
-                if vmag_key:
-                    def _vmag_sort(row):
-                        v = row.get(vmag_key)
-                        try:
-                            return float(v)
-                        except (TypeError, ValueError):
-                            return 999.0
-                    results_data = sorted(results_data, key=_vmag_sort)
-
-                # Select the most useful columns; fall back to all columns
-                KEY_COLS = ['MAIN_ID', 'FLUX_V', 'RA', 'DEC', 'SP_TYPE', 'OTYPE']
-                sample = results_data[0]
-                cols = [c for c in KEY_COLS if c in sample] or list(sample.keys())
-
-                MAX_INLINE = 25
-                preview = [{c: row.get(c) for c in cols} for row in results_data[:MAX_INLINE]]
-                label = "sorted by V magnitude (brightest first)" if vmag_key else "first results"
-                response += f"Results ({label}):\n"
-                response += json.dumps(preview, indent=2)
-                if result['num_results'] > MAX_INLINE:
-                    response += f"\n\n... {result['num_results'] - MAX_INLINE} more rows not shown."
-            elif isinstance(results_data, str):
-                response += results_data
-
-            # Footnote: mention saved file without directing LLM to call another tool
-            save_result = result.get('save_result')
-            if save_result and save_result.get('status') == 'success':
-                response += f"\n\nFull dataset saved to: {save_result['filename']}"
-
-            logger.info(
-                f"[astroquery_query] Tool response ({len(response)} chars):\n"
-                f"{'─' * 72}\n{response}\n{'─' * 72}"
-            )
-
-            return [types.TextContent(type="text", text=response)]
-        
         else:
             raise ValueError(f"Unknown tool: {name}")
     
@@ -685,7 +423,7 @@ async def _run_http(port: int):
 
     async def root(request):
         return JSONResponse({
-            "server": "astro-mcp",
+            "server": "astrollama-mcp",
             "version": "0.1.0",
             "mcp_endpoint": f"http://{request.headers.get('host', f'localhost:{port}')}/mcp",
             "transport": "streamable-http",
@@ -695,18 +433,18 @@ async def _run_http(port: int):
         routes=[
             Route("/", endpoint=root),
             Mount("/mcp", app=mcp_app),
-        ]
+        ],
     )
 
     config = uvicorn.Config(
         app=starlette_app,
-        host="0.0.0.0",
+        host="localhost",
         port=port,
         log_level="info",
     )
     uv_server = uvicorn.Server(config)
 
-    logger.info(f"Starting HTTP MCP server on http://0.0.0.0:{port}/mcp")
+    logger.info(f"Starting HTTP MCP server on http://localhost:{port}/mcp")
 
     async with session_manager.run():
         await uv_server.serve()

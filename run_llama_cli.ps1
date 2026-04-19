@@ -11,7 +11,7 @@ param(
     [string]$Prompt = "Hello",
     [int]$Predict = 1024,
 
-    [string]$ListenHost = "127.0.0.1",
+    [string]$ListenHost = "localhost",
     [int]$Port = 8081,
     [int]$ContextSize = 4096,
 

@@ -53,9 +53,9 @@ if (-not (Test-Path (Join-Path $McpDir "server.py"))) {
 
 Write-Host ""
 Write-Host "  MCP Server" -ForegroundColor Green
-Write-Host "  http://0.0.0.0:${Port}/mcp" -ForegroundColor Green
+Write-Host "  http://localhost:${Port}/mcp" -ForegroundColor Green
 Write-Host ""
 
-Set-Location $McpDir
-& $PythonExe server.py --http $Port
+Set-Location $RepoRoot
+& $PythonExe -m mcp_server.server --http $Port
 Set-Location ..

@@ -30,6 +30,7 @@ markdown>=3.7
 h5py      
 starlette
 astroquery 
+skyfield
 mocpy
 openmeteo-requests
 httpx 

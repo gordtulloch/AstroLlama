@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,7 @@ class Retriever:
         collection_name: str,
         embedding_model: str,
         top_k: int = 3,
+        hf_token: str = "",
     ) -> None:
         self.db_path = db_path
         self.collection_name = collection_name
@@ -30,6 +32,8 @@ class Retriever:
         self.top_k = top_k
         self._collection = None
         self._available = False
+        if hf_token:
+            os.environ.setdefault("HF_TOKEN", hf_token)
 
     def start(self) -> None:
         """Initialise ChromaDB client and embedding function.  Call once at startup."""

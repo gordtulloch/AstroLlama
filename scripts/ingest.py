@@ -228,6 +228,7 @@ def main() -> None:
         collection_name=settings.chroma_collection,
         embedding_model=settings.embedding_model,
         top_k=settings.rag_top_k,
+        hf_token=settings.hf_token,
     )
     retriever.start()
 

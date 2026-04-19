@@ -26,8 +26,8 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 # Enable DEBUG for tool/LLM diagnostics
-logging.getLogger("app.services.llm").setLevel(logging.WARNING)
-logging.getLogger("app.services.tool_orchestrator").setLevel(logging.WARNING)
+logging.getLogger("app.services.llm").setLevel(logging.DEBUG)
+logging.getLogger("app.services.tool_orchestrator").setLevel(logging.DEBUG)
 # The MCP SSE library logs its own ERROR + traceback before raising when the
 # server is unreachable. We handle that gracefully in MCPClient.start() and
 # emit our own WARNING, so suppress the library's internal noise.
@@ -71,6 +71,7 @@ async def lifespan(app: FastAPI):
         collection_name=settings.chroma_collection,
         embedding_model=settings.embedding_model,
         top_k=settings.rag_top_k,
+        hf_token=settings.hf_token,
     )
     if settings.rag_enabled:
         retriever.start()

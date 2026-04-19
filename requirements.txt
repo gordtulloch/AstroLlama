@@ -1,0 +1,37 @@
+pygments>=2.18.0
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+httpx>=0.28.0
+pydantic-settings>=2.7.0
+mcp>=1.4.0
+anyio>=4.7.0
+chromadb>=0.6.0
+sentence-transformers>=3.4.0
+scrapy>=2.12.0
+pdfplumber>=0.11.0
+pymupdf>=1.24.0
+pytesseract>=0.3.13
+python-docx>=1.1.0
+beautifulsoup4>=4.13.0
+lxml>=5.3.0
+msal>=1.31.0
+python-jose[cryptography]>=3.3.0
+requests==2.31.0
+# mcp
+mcp
+pydantic
+#sparclclient     # DESI SPARCL access
+astro-datalab    # NOAO Data Lab access — this is the version compatible with Python 3.13+ and does not include the 'cgi' module, which was removed in Python 3.13.
+dace-query       # DACE (Data & Analysis Center for Exoplanets) — replaces removed astroquery.dace module
+pandas
+numpy
+astropy
+markdown>=3.7
+h5py      
+starlette
+astroquery 
+mocpy
+openmeteo-requests
+httpx 
+requests-cache 
+retry-requests

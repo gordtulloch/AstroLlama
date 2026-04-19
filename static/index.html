@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LocalAI Chat</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Unica+One&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- Sidebar -->
+    <aside id="sidebar">
+      <div id="sidebar-header">
+        <div id="sidebar-brand">
+          <img id="sidebar-logo" src="astrollama.png" alt="Astrollama Logo" />
+          <span id="brand-name">AstroLlama</span>
+        </div>
+      </div>
+
+      <div id="status-bar">
+        <span id="status-llama" class="status-chip">llama &#9679;</span>
+        <span id="status-mcp" class="status-chip">mcp &#9679;</span>
+      </div>
+
+      <div id="auth-bar">
+        <div id="auth-user">Not signed in</div>
+        <div id="auth-actions">
+          <button id="btn-login" title="Sign in with Microsoft Entra">Sign in</button>
+          <button id="btn-logout" title="Sign out">Sign out</button>
+        </div>
+      </div>
+
+      <div id="conv-list-header">Saved conversations</div>
+      <ul id="conv-list"></ul>
+
+      <div id="sidebar-footer">
+        <button id="btn-new-chat" title="New conversation">&#43; New</button>
+        <button id="btn-save-conv" title="Save current conversation">&#128190; Save</button>
+      </div>
+    </aside>
+
+    <!-- Main chat area -->
+    <main id="main">
+      <div id="messages"></div>
+
+      <div id="input-area">
+        <textarea
+          id="prompt-input"
+          placeholder="Message… (Enter to send, Shift+Enter for newline)"
+          rows="3"
+          autofocus
+        ></textarea>
+        <div id="input-controls">
+          <button id="btn-send" class="btn-primary">Send</button>
+          <button id="btn-cancel" class="btn-danger" disabled>Cancel</button>
+          <details id="settings-panel">
+            <summary>&#9881; Settings</summary>
+            <div class="settings-grid">
+              <label>Temperature
+                <input type="number" id="s-temperature" min="0" max="2" step="0.05" value="0.7" />
+              </label>
+              <label>Top-p
+                <input type="number" id="s-top_p" min="0" max="1" step="0.05" value="0.9" />
+              </label>
+              <label>Max tokens
+                <input type="number" id="s-max_tokens" min="1" max="32768" step="64" value="1024" />
+              </label>
+              <label class="full-width">System prompt
+                <textarea id="s-system_prompt" rows="3" placeholder="(optional)"></textarea>
+              </label>
+            </div>
+          </details>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <!-- MSAL is loaded dynamically by app.js with fallback CDN support -->
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

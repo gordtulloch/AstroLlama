@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "mcp_server": {
+      "command": "C:\\Projects\\AstroChat\\mcp_server\\.venv\\Scripts\\python.exe",
+      "args": ["C:\\Projects\\AstroChat\\mcp_server\\server.py"],
+      "cwd": "C:\\Projects\\AstroChat\\mcp_server",
+      "env": {}
+    },
+    "astro-mcp-http": {
+      "type": "streamable-http",
+      "url": "http://0.0.0.0:8000/mcp"
+    }
+  }
+} 

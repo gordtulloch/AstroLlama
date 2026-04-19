@@ -1,0 +1,57 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+Cargo.lock
+logs/*
+
+# AI Models
+*.gguf
+ai/*
+data/downloads/*
+
+# IDEs
+# Keep .vscode/ workspace settings for Rust/Bevy development
+# Only ignore user-specific files
+.vscode/*.log
+.vscode/settings.local.json
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+/dist/
+/build/
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.local
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# Saved conversations (runtime data — keep the .gitkeep placeholder)
+data/conversations/*.json
+
+# ChromaDB vector store (runtime data)
+data/chromadb/
+
+# Ingested source documents (local data — not committed)
+data/documents/*
+!data/documents/README.txt
+
+# Asset cache
+/tools/cache/

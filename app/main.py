@@ -26,8 +26,8 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 # Enable DEBUG for tool/LLM diagnostics
-logging.getLogger("app.services.llm").setLevel(logging.DEBUG)
-logging.getLogger("app.services.tool_orchestrator").setLevel(logging.DEBUG)
+logging.getLogger("app.services.llm").setLevel(logging.INFO)
+logging.getLogger("app.services.tool_orchestrator").setLevel(logging.INFO)
 # The MCP SSE library logs its own ERROR + traceback before raising when the
 # server is unreachable. We handle that gracefully in MCPClient.start() and
 # emit our own WARNING, so suppress the library's internal noise.

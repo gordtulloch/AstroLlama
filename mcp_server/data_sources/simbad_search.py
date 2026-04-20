@@ -458,8 +458,14 @@ def _query_constellation_objects(constellation: str, otype_filter: Optional[str]
 
     ra_c, dec_c = center_coords
 
-    # Expand otype_filter to include related sub-types (e.g. 'G' → Sy1, Sy2, AGN...)
-    if otype_filter and otype_filter in _OTYPE_GROUPS:
+    # Build the otype WHERE clause.
+    # Stars: SIMBAD has dozens of stellar subtypes (a2*, PM*, **, Em*, BY*, RS*,
+    # Pe*, etc.) — an inclusion list can never be complete.  Use NOT IN with the
+    # known non-stellar types instead, which is far more robust.
+    if otype_filter == "*":
+        non_stellar_quoted = ", ".join(f"'{t}'" for t in sorted(_NON_STELLAR_OTYPES))
+        otype_clause = f"AND otype NOT IN ({non_stellar_quoted})"
+    elif otype_filter and otype_filter in _OTYPE_GROUPS:
         group_types = _OTYPE_GROUPS[otype_filter]
         if len(group_types) == 1:
             otype_clause = f"AND otype = '{group_types[0]}'"

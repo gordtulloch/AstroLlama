@@ -23,11 +23,25 @@ async def download_file(filename: str) -> FileResponse:
         raise HTTPException(status_code=400, detail="Invalid filename")
 
     file_path = _DOWNLOADS_DIR / safe_name
+    logger.info("files: request for %r → resolved path %s (exists=%s)", safe_name, file_path, file_path.is_file())
     if not file_path.is_file():
         raise HTTPException(status_code=404, detail="File not found")
 
+    suffix = file_path.suffix.lower()
+    media_type = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".gif": "image/gif",
+        ".webp": "image/webp",
+    }.get(suffix, "application/octet-stream")
+
+    # Only set Content-Disposition: attachment for non-image files so that
+    # images load inline when referenced from an <img> src.
+    kwargs = {} if suffix in {".png", ".jpg", ".jpeg", ".gif", ".webp"} else {"filename": safe_name}
+
     return FileResponse(
         path=str(file_path),
-        filename=safe_name,
-        media_type="application/octet-stream",
+        media_type=media_type,
+        **kwargs,
     )

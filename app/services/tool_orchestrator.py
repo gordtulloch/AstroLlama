@@ -29,6 +29,15 @@ _MAX_TOOL_ITERATIONS = 10
 # Matches Mistral's [TOOL_CALLS] token followed by a JSON array
 _MISTRAL_TOOL_RE = re.compile(r"\[TOOL_CALLS\]\s*(\[.*?\])", re.DOTALL)
 
+# Matches an image URL produced by the generate_map tool
+_IMAGE_URL_RE = re.compile(r"/api/files/[^\s]+\.png")
+
+
+def _extract_image_url(result: str) -> str | None:
+    """Return the first /api/files/*.png URL found in *result*, or None."""
+    m = _IMAGE_URL_RE.search(result)
+    return m.group(0) if m else None
+
 
 def _parse_mistral_tool_calls(content: str) -> tuple[list[dict[str, Any]], str]:
     """
@@ -151,6 +160,9 @@ async def run_chat(
             "clusters, or other celestial objects — including lists of the brightest/nearest/largest, "
             "objects in a constellation, or objects of a specific type. "
             "Pass the user's question as-is in the 'query' parameter.\n"
+            "- Use the generate_map tool when the user asks to see a star chart, sky map, "
+            "what the night sky looks like, or wants a visual map of visible stars. "
+            "First call get_latlong to get coordinates if needed, then call generate_map.\n"
             "- Do NOT call a tool more than once for the same question. "
             "If a tool returns results, present them directly to the user without calling the tool again.\n"
             "- Only call get_weather or get_latlong for weather or location queries.\n"
@@ -186,6 +198,8 @@ async def run_chat(
                     llm_messages.insert(0, {"role": "system", "content": rag_addition.strip()})
 
                 logger.debug("RAG: injected %d chunk(s) into context", len(chunks))
+
+    pending_image_url: str | None = None
 
     for iteration in range(_MAX_TOOL_ITERATIONS):
         # Trim history to avoid exceeding the model's context window.
@@ -300,6 +314,12 @@ async def run_chat(
                     )
                 else:
                     yield {"type": "tool_result", "name": name, "result": result_str}
+                    # Emit an inline image event when the result contains a PNG URL
+                    image_url = _extract_image_url(result_str)
+                    logger.info("Tool image URL extracted from %s result: %s", name, image_url)
+                    if image_url:
+                        pending_image_url = image_url
+                        yield {"type": "tool_image", "name": name, "url": image_url}
                     llm_content = result_str
 
                 tool_msg: dict[str, Any] = {
@@ -333,5 +353,10 @@ async def run_chat(
 
     else:
         logger.warning("Tool call loop hit max iterations (%d)", _MAX_TOOL_ITERATIONS)
+
+    # Append the generated star map as a markdown image so it is rendered
+    # inline in the message even if the tool_image SSE event was ignored.
+    if pending_image_url:
+        yield {"type": "token", "text": f"\n\n![Star map]({pending_image_url})"}
 
     yield {"type": "done"}

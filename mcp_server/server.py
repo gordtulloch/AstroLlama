@@ -146,6 +146,27 @@ async def handle_list_tools() -> list[types.Tool]:
                 "required": ["latitude", "longitude"]
             }
         ),
+        types.Tool(
+            name="generate_map",
+            description=(
+                "Generate an all-sky zenith star map (sky chart) for a specific location and time. "
+                "Shows stars visible from that location at that time with constellation lines and labels. "
+                "Returns a link to a PNG image. "
+                "Use this when the user asks to see a star chart, sky map, what the night sky looks like, "
+                "or wants a visual representation of the stars visible from a given place and time."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "lat": {"type": "number", "description": "Observer latitude in decimal degrees (-90 to 90)"},
+                    "lon": {"type": "number", "description": "Observer longitude in decimal degrees (-180 to 180)"},
+                    "location_name": {"type": "string", "description": "Display name for the location (e.g. 'Winnipeg, Manitoba')", "default": "Unknown location"},
+                    "datetime_str": {"type": "string", "description": "ISO 8601 datetime string (e.g. '2026-04-19T22:00:00'), or 'now' for the current time", "default": "now"},
+                    "timezone": {"type": "string", "description": "IANA timezone name (e.g. 'America/Winnipeg', 'America/New_York', 'UTC'). Used when datetime_str is 'now' or lacks timezone info.", "default": "UTC"}
+                },
+                "required": ["lat", "lon"]
+            }
+        ),
     ]
 
 
@@ -177,6 +198,14 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
 
         elif name == "get_current_time":
             result = await _get_current_time(**arguments)
+            return [types.TextContent(type="text", text=result)]
+
+        elif name == "generate_map":
+            try:
+                from .data_sources.generate_map import generate_map
+            except ImportError:
+                from data_sources.generate_map import generate_map
+            result = await generate_map(**arguments)
             return [types.TextContent(type="text", text=result)]
 
         else:

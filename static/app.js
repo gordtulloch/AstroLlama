@@ -742,6 +742,19 @@
     }
   }
 
+  function addToolImage(msgEl, name, url) {
+    // Render the image directly in the message bubble (outside the collapsed
+    // tool-details panel) so it is always visible.
+    const existing = msgEl.querySelector(`.tool-image[data-tool-name="${CSS.escape(name)}"]`);
+    if (existing) return; // don't duplicate
+    const wrapper = document.createElement("div");
+    wrapper.className = "tool-image";
+    wrapper.dataset.toolName = name;
+    wrapper.innerHTML = `<img src="${escHtml(url)}" alt="Star map"
+      style="max-width:100%;border-radius:6px;margin-top:8px;display:block;">`;
+    msgEl.appendChild(wrapper);
+  }
+
   function addToolError(msgEl, name, error) {
     const details = ensureToolDetails(msgEl);
     const errDiv = document.createElement("div");
@@ -897,6 +910,11 @@
 
             case "tool_download":
               addToolDownload(aiBubble, event.name, event.url, event.size);
+              scrollToBottom();
+              break;
+
+            case "tool_image":
+              addToolImage(aiBubble, event.name, event.url);
               scrollToBottom();
               break;
 

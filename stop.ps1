@@ -63,6 +63,7 @@ Write-Host ""
 Stop-ByName        -WinName "llama-server" -UnixMatch "llama-server"   -Label "llama-server"
 Stop-ByCommandLine -Match "mcp_server/server.py"  -Label "MCP server"
 Stop-ByCommandLine -Match "mcp_server\server.py"  -Label "MCP server"
+Stop-ByCommandLine -Match "mcp_server.server"     -Label "MCP server"
 Stop-ByCommandLine -Match "app.main:app"           -Label "FastAPI client"
 
 # Close the PowerShell host windows that were opened by start.ps1 (-NoExit).

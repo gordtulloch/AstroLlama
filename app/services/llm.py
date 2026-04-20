@@ -71,7 +71,6 @@ class LLMClient:
                     len(messages),
                     len(tools),
                     [t["function"]["name"] for t in tools] or "(none)")
-        logger.debug("LLM full payload: %s", json.dumps(payload, ensure_ascii=False))
 
         url = f"{self.base_url}/v1/chat/completions"
         for attempt in range(_RETRIES):

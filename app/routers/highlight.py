@@ -25,13 +25,42 @@ _FORMATTER = HtmlFormatter(style=_STYLE, cssclass="highlight")
 # \n? before closing fence tolerates a trailing newline inside the block.
 _CODE_BLOCK_RE = re.compile(r"```(\w*)[^\S\r\n]*\n([\s\S]*?\n?)```", re.MULTILINE)
 
+# Matches bare "Image: /api/files/<name>.ext" lines produced by generate_map.
+_IMAGE_LINE_RE = re.compile(
+    r"(?m)^Image:\s*(/api/files/[^\s]+\.(?:png|jpg|jpeg|gif|webp))$",
+    re.IGNORECASE,
+)
+
+# Matches markdown images whose URL points to /api/files/, e.g. ![alt](/api/files/foo.png)
+_MD_IMAGE_RE = re.compile(
+    r"!\[[^\]]*\]\((/api/files/[^\s)]+\.(?:png|jpg|jpeg|gif|webp))\)",
+    re.IGNORECASE,
+)
+
+_IMG_EXTS = re.compile(r"\.(?:png|jpg|jpeg|gif|webp)$", re.IGNORECASE)
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+def _make_thumbnail_html(url_raw: str) -> str:
+    url = html_module.escape(url_raw, quote=True)
+    return (
+        f'\n<div class="map-thumbnail-wrap">'
+        f'<a href="{url}" target="_blank" rel="noopener noreferrer">'
+        f'<img src="{url}" class="map-thumbnail" alt="Star map" />'
+        f'</a></div>\n'
+    )
+
+
 def _render_prose(text: str) -> str:
     """Render plain prose with full markdown support (no fenced code — handled separately)."""
+    # Convert bare "Image: /api/files/..." lines into thumbnail HTML.
+    text = _IMAGE_LINE_RE.sub(lambda m: _make_thumbnail_html(m.group(1)), text)
+    # Convert markdown images pointing at /api/files/ into thumbnail HTML
+    # BEFORE markdown() turns them into unconstrained <img> tags.
+    text = _MD_IMAGE_RE.sub(lambda m: _make_thumbnail_html(m.group(1)), text)
     return markdown_lib.markdown(
         text.strip(),
         extensions=["tables", "sane_lists"],

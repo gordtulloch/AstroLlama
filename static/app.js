@@ -748,10 +748,12 @@
     const existing = msgEl.querySelector(`.tool-image[data-tool-name="${CSS.escape(name)}"]`);
     if (existing) return; // don't duplicate
     const wrapper = document.createElement("div");
-    wrapper.className = "tool-image";
+    wrapper.className = "tool-image map-thumbnail-wrap";
     wrapper.dataset.toolName = name;
-    wrapper.innerHTML = `<img src="${escHtml(url)}" alt="Star map"
-      style="max-width:100%;border-radius:6px;margin-top:8px;display:block;">`;
+    wrapper.innerHTML =
+      `<a href="${escHtml(url)}" target="_blank" rel="noopener noreferrer">` +
+      `<img src="${escHtml(url)}" class="map-thumbnail" alt="Star map">` +
+      `</a>`;
     msgEl.appendChild(wrapper);
   }
 
@@ -943,9 +945,25 @@
               if (assistantText) {
                 state.messages.push({ role: "assistant", content: assistantText });
                 if (contentEl) {
-                  contentEl.innerHTML = await renderHighlighted(assistantText);
-                  scrollToBottom();
+                  // Strip bare "Image: /api/files/..." lines and markdown images
+                  // pointing at /api/files/ before rendering — addToolImage already
+                  // rendered those as thumbnails in the bubble.
+                  // The full text is preserved in state.messages so conversation
+                  // history replays render them as thumbnails via renderHighlighted.
+                  const textForRender = assistantText
+                    .replace(/^Image:\s*\/api\/files\/\S+$/gim, "")
+                    .replace(/!\[[^\]]*\]\(\/api\/files\/[^)]+\)/gi, "")
+                    .trim();
+                  contentEl.innerHTML = textForRender
+                    ? await renderHighlighted(textForRender)
+                    : "";
                 }
+                // Re-append all tool-image thumbnails so they always appear
+                // after the text content, regardless of SSE event order.
+                aiBubble.querySelectorAll(".tool-image").forEach(
+                  el => aiBubble.appendChild(el)
+                );
+                scrollToBottom();
               }
               break;
           }

@@ -111,6 +111,25 @@ function Stop-ByName {
 }
 
 # ---------------------------------------------------------------------------
+# Helper: stop any process listening on a given port (fallback for -m module launches)
+# ---------------------------------------------------------------------------
+function Stop-ByPort {
+    param([int]$Port, [string]$Label)
+    $killed = 0
+    $pids = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
+        Select-Object -ExpandProperty OwningProcess -Unique
+    foreach ($pid in $pids) {
+        try { Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue; $killed++ } catch { }
+    }
+    if ($killed -gt 0) {
+        Write-Host "  Stopped $killed $Label process(es) on port $Port." -ForegroundColor DarkYellow
+    } else {
+        Write-Host "  No $Label process found on port $Port." -ForegroundColor DarkGray
+    }
+    return $killed
+}
+
+# ---------------------------------------------------------------------------
 # Stop phase
 # ---------------------------------------------------------------------------
 Write-Host ""
@@ -123,9 +142,11 @@ Write-Host ""
 # llama-server (native binary)
 $null = Stop-ByName -WinName "llama-server" -UnixMatch "llama-server" -Label "llama-server"
 
-# MCP server (Python running mcp_server/server.py)
+# MCP server (Python running mcp_server/server.py or -m mcp_server.server)
 $null = Stop-ByCommandLine -Match "mcp_server/server.py"  -Label "MCP server"
 $null = Stop-ByCommandLine -Match "mcp_server\server.py"  -Label "MCP server"  # Windows path variant
+$null = Stop-ByCommandLine -Match "mcp_server.server"     -Label "MCP server (module)"  # -m mcp_server.server
+$null = Stop-ByPort        -Port 8000                     -Label "MCP server (port 8000)"  # fallback: kill by port
 
 # FastAPI / uvicorn client (app.main:app)
 $null = Stop-ByCommandLine -Match "app.main:app" -Label "FastAPI client"

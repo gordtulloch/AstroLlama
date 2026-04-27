@@ -354,9 +354,10 @@ async def run_chat(
     else:
         logger.warning("Tool call loop hit max iterations (%d)", _MAX_TOOL_ITERATIONS)
 
-    # Append the generated star map as a markdown image so it is rendered
-    # inline in the message even if the tool_image SSE event was ignored.
+    # Append the generated star map using the Image: format so the highlight
+    # renderer converts it to a clickable thumbnail (same as addToolImage)
+    # in case the tool_image SSE event was missed.
     if pending_image_url:
-        yield {"type": "token", "text": f"\n\n![Star map]({pending_image_url})"}
+        yield {"type": "token", "text": f"\nImage: {pending_image_url}"}
 
     yield {"type": "done"}

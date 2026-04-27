@@ -153,7 +153,8 @@ async def handle_list_tools() -> list[types.Tool]:
                 "Shows stars visible from that location at that time with constellation lines and labels. "
                 "Returns a link to a PNG image. "
                 "Use this when the user asks to see a star chart, sky map, what the night sky looks like, "
-                "or wants a visual representation of the stars visible from a given place and time."
+                "or wants a visual representation of the stars visible from a given place and time. "
+                "Do NOT use this when the user asks about a specific constellation — use generate_constellation_map instead."
             ),
             inputSchema={
                 "type": "object",
@@ -165,6 +166,26 @@ async def handle_list_tools() -> list[types.Tool]:
                     "timezone": {"type": "string", "description": "IANA timezone name (e.g. 'America/Winnipeg', 'America/New_York', 'UTC'). Used when datetime_str is 'now' or lacks timezone info.", "default": "UTC"}
                 },
                 "required": ["lat", "lon"]
+            }
+        ),
+        types.Tool(
+            name="generate_constellation_map",
+            description=(
+                "Generate a detailed star chart centred on a specific constellation, showing its stars, "
+                "deep-sky objects, and Milky Way within the constellation boundaries. "
+                "Returns a link to a PNG image. "
+                "Use this whenever the user mentions a specific constellation by name and wants to see it, "
+                "e.g. 'show me Orion', 'map of Scorpius', 'what does Cassiopeia look like'."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "constellation": {
+                        "type": "string",
+                        "description": "Constellation name (full name such as 'Orion', 'Ursa Major', or IAU abbreviation such as 'ORI', 'UMA')"
+                    }
+                },
+                "required": ["constellation"]
             }
         ),
     ]
@@ -206,6 +227,14 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
             except ImportError:
                 from data_sources.generate_map import generate_map
             result = await generate_map(**arguments)
+            return [types.TextContent(type="text", text=result)]
+
+        elif name == "generate_constellation_map":
+            try:
+                from .data_sources.generate_constellation_map import generate_constellation_map
+            except ImportError:
+                from data_sources.generate_constellation_map import generate_constellation_map
+            result = await generate_constellation_map(**arguments)
             return [types.TextContent(type="text", text=result)]
 
         else:

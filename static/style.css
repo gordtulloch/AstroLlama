@@ -368,6 +368,26 @@ html, body { height: 100%; font-family: system-ui, sans-serif; background: var(-
   width: 100%;
 }
 
+/* ---- Star-map thumbnail ----------------------------------- */
+.map-thumbnail-wrap {
+  margin: 10px 0;
+}
+
+.map-thumbnail {
+  display: block;
+  max-width: 220px;
+  max-height: 220px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  cursor: pointer;
+  transition: opacity 0.15s, box-shadow 0.15s;
+}
+
+.map-thumbnail:hover {
+  opacity: 0.85;
+  box-shadow: 0 0 0 2px var(--accent);
+}
+
 /* ---- Tool call details ------------------------------------- */
 .tool-details {
   margin-top: 10px;

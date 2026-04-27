@@ -108,4 +108,17 @@ app.include_router(highlight_router.router)
 # Serve the static single-page UI
 _static_dir = _REPO_ROOT / "static"
 if _static_dir.exists():
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.requests import Request as StarletteRequest
+
+    class _NoCacheStaticMiddleware(BaseHTTPMiddleware):
+        """Add no-cache headers for JS/CSS static assets so browser always fetches fresh."""
+        async def dispatch(self, request: StarletteRequest, call_next):
+            response = await call_next(request)
+            path = request.url.path
+            if path.endswith((".js", ".css")):
+                response.headers["Cache-Control"] = "no-cache, must-revalidate"
+            return response
+
+    app.add_middleware(_NoCacheStaticMiddleware)
     app.mount("/", StaticFiles(directory=str(_static_dir), html=True), name="static")

@@ -55,6 +55,21 @@ function Stop-ByName {
     }
 }
 
+function Stop-ByPort {
+    param([int]$Port, [string]$Label)
+    $killed = 0
+    $pids = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
+        Select-Object -ExpandProperty OwningProcess -Unique
+    foreach ($pid in $pids) {
+        try { Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue; $killed++ } catch { }
+    }
+    if ($killed -gt 0) {
+        Write-Host "  Stopped $killed $Label process(es) on port $Port." -ForegroundColor DarkYellow
+    } else {
+        Write-Host "  No $Label process found on port $Port." -ForegroundColor DarkGray
+    }
+}
+
 Write-Host ""
 Write-Host "  AstroLlama Stop" -ForegroundColor Cyan
 Write-Host "  ===============" -ForegroundColor Cyan
@@ -64,6 +79,7 @@ Stop-ByName        -WinName "llama-server" -UnixMatch "llama-server"   -Label "l
 Stop-ByCommandLine -Match "mcp_server/server.py"  -Label "MCP server"
 Stop-ByCommandLine -Match "mcp_server\server.py"  -Label "MCP server"
 Stop-ByCommandLine -Match "mcp_server.server"     -Label "MCP server"
+Stop-ByPort        -Port 8000                      -Label "MCP server (port 8000)"
 Stop-ByCommandLine -Match "app.main:app"           -Label "FastAPI client"
 
 # Close the PowerShell host windows that were opened by start.ps1 (-NoExit).

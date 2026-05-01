@@ -1,28 +1,36 @@
 """
 Web crawler and ingestion script for ChromaDB RAG.
 
-Crawls a website using Scrapy, extracts text from HTML pages, PDFs, and DOCX
-files, then ingests the results directly into ChromaDB.
+Crawls a website using Crawl4AI (headless Chromium via Playwright), extracts
+clean Markdown from HTML pages, and ingests the results into ChromaDB.
+JavaScript-rendered and dynamically loaded pages are supported natively.
 
 Usage:
     python scripts/web_ingest.py --url https://www.sunrisesd.ca
     python scripts/web_ingest.py --url https://www.sunrisesd.ca --depth 3
     python scripts/web_ingest.py --url https://www.sunrisesd.ca --delay 1.0
+    python scripts/web_ingest.py --url https://www.sunrisesd.ca --max-pages 50
     python scripts/web_ingest.py --url https://www.sunrisesd.ca --clear
 
 Options:
     --url               Start URL to crawl (required)
     --depth             Maximum crawl depth (default: 3)
-    --delay             Seconds between requests, be polite! (default: 0.5)
+    --delay             Seconds to wait after each page load (default: 0.5)
+    --max-pages         Maximum total pages to crawl (default: 0 = unlimited)
     --chunk-size        Characters per chunk (default: 500)
     --chunk-overlap     Overlap between chunks (default: 50)
     --clear             Wipe the collection before ingesting
-    --dry-run           Print what would be ingested without writing to ChromaDB
-    --login-url         URL of the login form to POST to before crawling
+    --dry-run           Print page count without writing to ChromaDB
+    --retries           Retry rounds when anti-bot blocking is detected (default: 0)
+    --proxy             Proxy server URL (e.g. http://user:pass@host:8080).
+                        When set, each retry round first tries direct then escalates
+                        to this proxy. Can be repeated for multiple proxies.
+    --stealth           Enable Playwright stealth mode + magic popup handling
+    --login-url         URL of the login page to authenticate before crawling
     --username          Username / email for login (use with --login-url)
     --password          Password for login (use with --login-url)
-    --login-user-field  Form field name for username (default: log  — WordPress default)
-    --login-pass-field  Form field name for password (default: pwd  — WordPress default)
+    --login-user-field  name attribute of the username input (default: log — WordPress default)
+    --login-pass-field  name attribute of the password input (default: pwd — WordPress default)
 
 Login example (WordPress / SiteGround):
     python scripts/web_ingest.py --url https://members.example.com \\
@@ -32,16 +40,14 @@ Login example (WordPress / SiteGround):
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
-import io
 import logging
 import sys
-import tempfile
-import threading
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
-# Allow running from repo root
+# Allow running from repo root: python scripts/web_ingest.py
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from app.config import settings
@@ -58,37 +64,7 @@ _REPO_ROOT = Path(__file__).parent.parent
 
 
 # ---------------------------------------------------------------------------
-# Text extraction helpers
-# ---------------------------------------------------------------------------
-
-def _extract_html(html: bytes | str) -> str:
-    from bs4 import BeautifulSoup
-    soup = BeautifulSoup(html, "lxml")
-    # Remove boilerplate tags
-    for tag in soup(["script", "style", "nav", "footer", "header", "noscript"]):
-        tag.decompose()
-    return soup.get_text(separator="\n", strip=True)
-
-
-def _extract_pdf(data: bytes) -> str:
-    import pdfplumber
-    text_parts: list[str] = []
-    with pdfplumber.open(io.BytesIO(data)) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text()
-            if text:
-                text_parts.append(text)
-    return "\n\n".join(text_parts)
-
-
-def _extract_docx(data: bytes) -> str:
-    import docx
-    doc = docx.Document(io.BytesIO(data))
-    return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
-
-
-# ---------------------------------------------------------------------------
-# Chunking
+# Chunking helpers
 # ---------------------------------------------------------------------------
 
 def _chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
@@ -107,121 +83,114 @@ def _stable_id(url: str, chunk_index: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Scrapy spider (runs in a thread)
+# Crawl4AI crawl (async)
 # ---------------------------------------------------------------------------
 
-class _TextItem:
-    """Simple container passed from spider to main thread."""
-    __slots__ = ("url", "text", "content_type")
+async def _crawl(args: argparse.Namespace) -> list[tuple[str, str]]:
+    """Crawl *args.url* and return a list of (page_url, markdown_text) pairs."""
+    from crawl4ai import AsyncWebCrawler, CacheMode
+    from crawl4ai.async_configs import BrowserConfig, CrawlerRunConfig, ProxyConfig
+    from crawl4ai.deep_crawling import BFSDeepCrawlStrategy
+    from crawl4ai.content_scraping_strategy import LXMLWebScrapingStrategy
+    from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
+    from crawl4ai.content_filter_strategy import PruningContentFilter
 
-    def __init__(self, url: str, text: str, content_type: str) -> None:
-        self.url = url
-        self.text = text
-        self.content_type = content_type
+    md_generator = DefaultMarkdownGenerator(
+        content_filter=PruningContentFilter(threshold=0.4, threshold_type="fixed")
+    )
 
+    deep_strategy = BFSDeepCrawlStrategy(
+        max_depth=args.depth,
+        include_external=False,
+        max_pages=args.max_pages if args.max_pages else None,
+    )
 
-def _run_spider(
-    start_url: str,
-    allowed_domain: str,
-    max_depth: int,
-    delay: float,
-    items: list[_TextItem],
-    errors: list[str],
-    login_url: str | None = None,
-    login_user_field: str = "log",
-    login_pass_field: str = "pwd",
-    username: str | None = None,
-    password: str | None = None,
-) -> None:
-    """Run the Scrapy spider synchronously in a worker thread."""
-    import scrapy
-    from scrapy.crawler import CrawlerProcess
-    from scrapy.http import Response
+    # ---- Proxy escalation list --------------------------------------------
+    # If one or more --proxy values are given, build an ordered list that tries
+    # direct first, then each proxy in turn.  Each retry round repeats the
+    # whole list, so worst-case attempts = (1 + retries) × len(proxy_config).
+    proxy_config: list[ProxyConfig] | None = None
+    if args.proxy:
+        proxy_config = [ProxyConfig.DIRECT] + [
+            ProxyConfig(server=p) for p in args.proxy
+        ]
+        logger.info(
+            "Proxy escalation: direct → %s  (retries=%d)",
+            ", ".join(args.proxy),
+            args.retries,
+        )
 
-    class SiteSpider(scrapy.Spider):
-        name = "site_spider"
-        allowed_domains = [allowed_domain]
-        start_urls = [start_url]
-        custom_settings = {
-            "DOWNLOAD_DELAY": delay,
-            "DEPTH_LIMIT": max_depth,
-            "ROBOTSTXT_OBEY": True,
-            "COOKIES_ENABLED": True,
-            "USER_AGENT": "SoleilAI-RAG-Crawler/1.0 (research; contact admin@sunrisesd.ca)",
-            "LOG_LEVEL": "WARNING",
-            "HTTPCACHE_ENABLED": False,
-            # Accept HTML and common document types
-            "ACCEPT_TYPES": ["text/html", "application/pdf",
-                             "application/vnd.openxmlformats-officedocument"
-                             ".wordprocessingml.document"],
-        }
+    run_config = CrawlerRunConfig(
+        cache_mode=CacheMode.BYPASS,
+        deep_crawl_strategy=deep_strategy,
+        scraping_strategy=LXMLWebScrapingStrategy(),
+        markdown_generator=md_generator,
+        delay_before_return_html=args.delay,
+        stream=True,
+        verbose=False,
+        # Anti-bot retry / proxy escalation
+        max_retries=args.retries,
+        proxy_config=proxy_config,
+        # Stealth helpers recommended for anti-bot sites
+        magic=args.stealth,
+        wait_until="load" if args.stealth else "domcontentloaded",
+    )
 
-        async def start(self):
-            if login_url and username and password:
-                yield scrapy.Request(login_url, callback=self._do_login, dont_filter=True)
-            else:
-                for url in self.start_urls:
-                    yield scrapy.Request(url, callback=self.parse)
+    browser_config = BrowserConfig(
+        headless=True,
+        enable_stealth=args.stealth,
+        user_agent=(
+            "AstroLlama-RAG-Crawler/2.0 "
+            "(headless; research use; contact admin if you have concerns)"
+        ),
+    )
 
-        def _do_login(self, response: Response):
-            # Capture hidden fields (nonce, redirect_to, etc.) from the form
-            hidden = dict(zip(
-                response.css("input[type=hidden]::attr(name)").getall(),
-                response.css("input[type=hidden]::attr(value)").getall(),
-            ))
-            form_data = {**hidden, login_user_field: username, login_pass_field: password}
-            # Resolve the form action against the current page URL;
-            # fall back to the login_url if the action attribute is absent or empty
-            raw_action = response.css("form::attr(action)").get("") or ""
-            action = response.urljoin(raw_action) if raw_action else login_url
-            logger.info("Submitting login form to %s", action)
-            yield scrapy.FormRequest(url=action, formdata=form_data,
-                                     callback=self._after_login)
+    pages: list[tuple[str, str]] = []
 
-        def _after_login(self, response: Response):
-            if "incorrect" in response.text.lower() or "error" in response.url.lower():
-                logger.error("Login appears to have failed at %s — check credentials",
-                             response.url)
-            else:
-                logger.info("Login succeeded, starting crawl from %s", start_url)
-            for url in self.start_urls:
-                yield scrapy.Request(url, callback=self.parse, dont_filter=True)
+    # ---- Optional login hook via Playwright --------------------------------
+    if args.login_url and args.username and args.password:
+        user_selector = f"input[name='{args.login_user_field}']"
+        pass_selector = f"input[name='{args.login_pass_field}']"
 
-        def parse(self, response: Response):
-            content_type = response.headers.get("Content-Type", b"").decode().split(";")[0].strip()
-
+        async def _login_hook(page, context, **kwargs):
+            logger.info("Authenticating at %s", args.login_url)
             try:
-                if "pdf" in content_type:
-                    text = _extract_pdf(response.body)
-                    if text.strip():
-                        items.append(_TextItem(response.url, text, "pdf"))
-
-                elif "wordprocessingml" in content_type or response.url.endswith(".docx"):
-                    text = _extract_docx(response.body)
-                    if text.strip():
-                        items.append(_TextItem(response.url, text, "docx"))
-
+                await page.goto(args.login_url, wait_until="domcontentloaded")
+                await page.fill(user_selector, args.username)
+                await page.fill(pass_selector, args.password)
+                await page.click("input[type=submit], button[type=submit]")
+                await page.wait_for_load_state("domcontentloaded")
+                content = await page.content()
+                if "incorrect" in content.lower() or "invalid" in content.lower():
+                    logger.warning("Login may have failed — check credentials")
                 else:
-                    # Default: treat as HTML
-                    text = _extract_html(response.body)
-                    if text.strip():
-                        items.append(_TextItem(response.url, text, "html"))
-
-                    # Follow links on HTML pages
-                    for href in response.css("a::attr(href)").getall():
-                        absolute = urljoin(response.url, href)
-                        parsed = urlparse(absolute)
-                        if parsed.netloc == allowed_domain or parsed.netloc == "":
-                            yield response.follow(href, callback=self.parse)
-
+                    logger.info("Login succeeded, proceeding with crawl")
             except Exception as exc:
-                err = f"{response.url}: {exc}"
-                errors.append(err)
-                logger.warning("Extraction error — %s", err)
+                logger.error("Login hook error: %s", exc)
+            return page
 
-    process = CrawlerProcess()
-    process.crawl(SiteSpider)
-    process.start()  # blocks until complete
+    # ---- Crawl -------------------------------------------------------------
+    async with AsyncWebCrawler(config=browser_config) as crawler:
+        if args.login_url and args.username and args.password:
+            crawler.crawler_strategy.set_hook("on_page_context_created", _login_hook)
+
+        async for result in await crawler.arun(args.url, config=run_config):
+            if not result.success:
+                stats = getattr(result, "crawl_stats", {})
+                logger.warning(
+                    "Failed: %s — %s (attempts=%s, resolved_by=%s)",
+                    result.url,
+                    result.error_message,
+                    stats.get("attempts", "?"),
+                    stats.get("resolved_by", "none"),
+                )
+                continue
+            text = (result.markdown.fit_markdown if result.markdown else "") or ""
+            if text.strip():
+                pages.append((result.url, text))
+                logger.info("[html] %s (%d chars)", result.url, len(text))
+
+    return pages
 
 
 # ---------------------------------------------------------------------------
@@ -231,9 +200,12 @@ def _run_spider(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Crawl a website and ingest into ChromaDB")
     parser.add_argument("--url", required=True, help="Start URL to crawl")
-    parser.add_argument("--depth", type=int, default=3, help="Maximum crawl depth (default: 3)")
+    parser.add_argument("--depth", type=int, default=3,
+                        help="Maximum crawl depth (default: 3)")
     parser.add_argument("--delay", type=float, default=0.5,
-                        help="Seconds between requests (default: 0.5)")
+                        help="Seconds to wait after each page load (default: 0.5)")
+    parser.add_argument("--max-pages", type=int, default=0,
+                        help="Maximum pages to crawl (default: 0 = unlimited)")
     parser.add_argument("--chunk-size", type=int, default=500,
                         help="Characters per chunk (default: 500)")
     parser.add_argument("--chunk-overlap", type=int, default=50,
@@ -241,27 +213,34 @@ def main() -> None:
     parser.add_argument("--clear", action="store_true",
                         help="Wipe the collection before ingesting")
     parser.add_argument("--login-url", default=None,
-                        help="URL of the login form (e.g. https://example.com/wp-login.php)")
+                        help="URL of the login page (e.g. https://example.com/wp-login.php)")
     parser.add_argument("--username", default=None,
                         help="Username or email for login")
     parser.add_argument("--password", default=None,
                         help="Password for login")
     parser.add_argument("--login-user-field", default="log",
-                        help="Form field name for username (default: log — WordPress)")
+                        help="name attribute of the username input (default: log — WordPress)")
     parser.add_argument("--login-pass-field", default="pwd",
-                        help="Form field name for password (default: pwd — WordPress)")
+                        help="name attribute of the password input (default: pwd — WordPress)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print page count without writing to ChromaDB")
+    parser.add_argument("--retries", type=int, default=0,
+                        help="Retry rounds when anti-bot blocking is detected (default: 0)")
+    parser.add_argument("--proxy", action="append", default=[],
+                        metavar="URL",
+                        help="Proxy server URL (repeatable). Each retry round tries direct "
+                             "first then escalates through the list in order.")
+    parser.add_argument("--stealth", action="store_true",
+                        help="Enable Playwright stealth mode and magic popup handling")
     args = parser.parse_args()
 
     # Normalise backslashes (common when copy-pasting URLs in PowerShell)
     url = args.url.replace("\\", "/")
     parsed = urlparse(url)
-    allowed_domain = parsed.netloc
-    if not allowed_domain or parsed.scheme not in ("http", "https"):
-        logger.error("Invalid URL: %s  (tip: use forward slashes, e.g. https://example.com)", url)
+    if not parsed.netloc or parsed.scheme not in ("http", "https"):
+        logger.error("Invalid URL: %s  (tip: use https://example.com)", url)
         sys.exit(1)
-    args.url = url  # propagate normalised URL
+    args.url = url
 
     # ------------------------------------------------------------------
     # Initialise retriever (unless dry-run)
@@ -298,55 +277,45 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Crawl
     # ------------------------------------------------------------------
-    logger.info("Starting crawl of %s (depth=%d, delay=%.1fs)", args.url, args.depth, args.delay)
-
-    items: list[_TextItem] = []
-    errors: list[str] = []
-
-    _run_spider(
-        args.url, allowed_domain, args.depth, args.delay, items, errors,
-        login_url=args.login_url,
-        login_user_field=args.login_user_field,
-        login_pass_field=args.login_pass_field,
-        username=args.username,
-        password=args.password,
+    logger.info(
+        "Starting crawl of %s (depth=%d, delay=%.1fs%s)",
+        args.url, args.depth, args.delay,
+        f", max-pages={args.max_pages}" if args.max_pages else "",
     )
 
-    logger.info("Crawl complete — %d page(s) fetched, %d error(s)", len(items), len(errors))
+    pages = asyncio.run(_crawl(args))
+
+    logger.info("Crawl complete — %d page(s) fetched", len(pages))
 
     if args.dry_run:
-        for item in items:
-            chunks = _chunk_text(item.text, args.chunk_size, args.chunk_overlap)
-            print(f"  [{item.content_type}] {item.url}  →  {len(chunks)} chunk(s)")
-        print(f"\nTotal pages: {len(items)}")
+        for page_url, text in pages:
+            chunks = _chunk_text(text, args.chunk_size, args.chunk_overlap)
+            print(f"  [html] {page_url}  →  {len(chunks)} chunk(s)")
+        print(f"\nTotal pages: {len(pages)}")
         return
 
     # ------------------------------------------------------------------
     # Ingest into ChromaDB
     # ------------------------------------------------------------------
     total_chunks = 0
-    for item in items:
-        chunks = _chunk_text(item.text, args.chunk_size, args.chunk_overlap)
+    for page_url, text in pages:
+        chunks = _chunk_text(text, args.chunk_size, args.chunk_overlap)
         if not chunks:
             continue
-        ids = [_stable_id(item.url, i) for i in range(len(chunks))]
+        ids = [_stable_id(page_url, i) for i in range(len(chunks))]
         metadatas = [
-            {"source": item.url, "content_type": item.content_type, "chunk": i}
+            {"source": page_url, "content_type": "html", "chunk": i}
             for i in range(len(chunks))
         ]
         retriever.add_documents(chunks, ids, metadatas)
         total_chunks += len(chunks)
-        logger.info("[%s] %s → %d chunk(s)", item.content_type, item.url, len(chunks))
+        logger.info("[html] %s → %d chunk(s)", page_url, len(chunks))
 
     logger.info(
         "Ingestion complete — %d chunk(s) added (collection total: %d)",
         total_chunks,
         retriever.document_count,
     )
-    if errors:
-        logger.warning("%d page(s) had extraction errors:", len(errors))
-        for e in errors:
-            logger.warning("  %s", e)
 
 
 if __name__ == "__main__":

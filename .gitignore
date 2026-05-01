@@ -1,14 +1,10 @@
-# Rust
-/target/
-**/*.rs.bk
-*.pdb
-Cargo.lock
-logs/*
-
 # AI Models
 *.gguf
 ai/*
 data/downloads/*
+
+# Downloaded datasets (keep .gitkeep for empty directories)
+*.parquet
 
 # IDEs
 # Keep .vscode/ workspace settings for Rust/Bevy development

@@ -126,8 +126,23 @@ python scripts/ingest.py --source path/to/file.pdf
 # Clear the collection and re-index
 python scripts/ingest.py --source data/documents --clear
 
-# Crawl a website and ingest its content
+# Crawl a website and ingest its content (requires crawl4ai — see below)
 python scripts/web_ingest.py --url https://example.com --depth 2
+
+# Limit pages, add a polite delay, or authenticate first
+python scripts/web_ingest.py --url https://example.com --depth 2 --max-pages 100 --delay 1.0
+python scripts/web_ingest.py --url https://members.example.com `
+    --login-url https://members.example.com/wp-login.php `
+    --username myuser --password mypassword
+```
+
+### Web crawling with Crawl4AI
+
+`web_ingest.py` uses [Crawl4AI](https://docs.crawl4ai.com/) for headless-browser crawling. It handles JavaScript-rendered pages, single-page apps, and paywalled sites that Scrapy cannot reach. After installing dependencies, run the one-time browser setup:
+
+```powershell
+pip install crawl4ai
+crawl4ai-setup   # downloads Playwright Chromium binaries (~150 MB)
 ```
 
 RAG is enabled by default (`RAG_ENABLED=true`). Set `RAG_ENABLED=false` in `.env` to disable it.

@@ -102,7 +102,7 @@ async def _crawl(args: argparse.Namespace) -> list[tuple[str, str]]:
     deep_strategy = BFSDeepCrawlStrategy(
         max_depth=args.depth,
         include_external=False,
-        max_pages=args.max_pages if args.max_pages else None,
+        **({"max_pages": args.max_pages} if args.max_pages else {}),
     )
 
     # ---- Proxy escalation list --------------------------------------------

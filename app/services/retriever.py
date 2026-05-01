@@ -53,6 +53,25 @@ class Retriever:
                 embedding_function=ef,
             )
             count = self._collection.count()
+
+            # Smoke-test the collection with a real query to catch database
+            # corruption that only surfaces on first read (e.g. half-written
+            # segment files).  A corrupted ChromaDB can throw from a background
+            # thread and kill the uvicorn process, so we catch it here instead.
+            if count > 0:
+                try:
+                    self._collection.query(query_texts=["test"], n_results=1)
+                except Exception as probe_exc:
+                    logger.error(
+                        "ChromaDB collection '%s' appears corrupted (query smoke-test failed: %s). "
+                        "RAG disabled. Run: python scripts/ingest.py --clear  then re-ingest.",
+                        self.collection_name,
+                        probe_exc,
+                    )
+                    self._collection = None
+                    self._available = False
+                    return
+
             self._available = True
             logger.info(
                 "ChromaDB ready — collection '%s' has %d document(s)",

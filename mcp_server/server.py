@@ -188,6 +188,83 @@ async def handle_list_tools() -> list[types.Tool]:
                 "required": ["constellation"]
             }
         ),
+        types.Tool(
+            name="generate_aavso_map",
+            description=(
+                "Generate an AAVSO Variable Star Plotter (VSP) finder chart for a variable star. "
+                "Fetches a PNG chart from the AAVSO VSP API showing the star field with "
+                "comparison star magnitudes. Returns a link to the chart image. "
+                "Use this when the user asks about a variable star chart, finder chart, "
+                "or wants to observe a variable star such as 'SS Cyg', 'Mira', 'RR Lyr', "
+                "'Delta Cephei', or any other variable star."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "star": {
+                        "type": "string",
+                        "description": "Name of the variable star, e.g. 'SS Cyg', 'Mira', 'RR Lyr'. Provide this OR ra+dec."
+                    },
+                    "ra": {
+                        "type": "number",
+                        "description": "Right Ascension in decimal degrees (0–360). Use with dec when star name is not known."
+                    },
+                    "dec": {
+                        "type": "number",
+                        "description": "Declination in decimal degrees (−90 to +90). Use with ra when star name is not known."
+                    },
+                    "fov": {
+                        "type": "number",
+                        "description": "Field of view in arcminutes (default 60).",
+                        "default": 60
+                    },
+                    "maglimit": {
+                        "type": "number",
+                        "description": "Faint magnitude limit for comparison stars on the chart (default 14.5).",
+                        "default": 14.5
+                    }
+                },
+                "required": []
+            }
+        ),
+        types.Tool(
+            name="variable_comparison_stars",
+            description=(
+                "Retrieve a table of comparison stars with photometric magnitudes for a variable star "
+                "from the AAVSO Variable Star Plotter (VSP) database. "
+                "Returns AUID, coordinates, chart label, and magnitudes in V, B, Rc, Ic, and near-IR bands. "
+                "Use this when the user asks for comparison stars, magnitude reference stars, "
+                "photometry data, or how to measure the brightness of a variable star."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "star": {
+                        "type": "string",
+                        "description": "Name of the variable star, e.g. 'SS Cyg', 'Mira', 'RR Lyr'. Provide this OR ra+dec."
+                    },
+                    "ra": {
+                        "type": "number",
+                        "description": "Right Ascension in decimal degrees (0\u2013360). Use with dec when star name is not known."
+                    },
+                    "dec": {
+                        "type": "number",
+                        "description": "Declination in decimal degrees (\u221290 to +90). Use with ra when star name is not known."
+                    },
+                    "fov": {
+                        "type": "number",
+                        "description": "Field of view in arcminutes (default 60).",
+                        "default": 60
+                    },
+                    "maglimit": {
+                        "type": "number",
+                        "description": "Faintest comparison star magnitude to include (default 14.5).",
+                        "default": 14.5
+                    }
+                },
+                "required": []
+            }
+        ),
     ]
 
 
@@ -235,6 +312,22 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
             except ImportError:
                 from data_sources.generate_constellation_map import generate_constellation_map
             result = await generate_constellation_map(**arguments)
+            return [types.TextContent(type="text", text=result)]
+
+        elif name == "generate_aavso_map":
+            try:
+                from .data_sources.generate_aavso_map import generate_aavso_map
+            except ImportError:
+                from data_sources.generate_aavso_map import generate_aavso_map
+            result = await generate_aavso_map(**arguments)
+            return [types.TextContent(type="text", text=result)]
+
+        elif name == "variable_comparison_stars":
+            try:
+                from .data_sources.variable_comparison_stars import variable_comparison_stars
+            except ImportError:
+                from data_sources.variable_comparison_stars import variable_comparison_stars
+            result = await variable_comparison_stars(**arguments)
             return [types.TextContent(type="text", text=result)]
 
         else:

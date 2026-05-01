@@ -107,6 +107,8 @@ _OTYPE_GROUPS = {
     "*":   ("*", "**", "SB*", "V*", "PM*", "RG*", "sg*", "s*b", "s*r", "s*y",
             "HB*", "Em*", "Be*", "Ae*", "TTau*", "AB*", "LP*", "Mi*", "OH*",
             "WD*", "NS", "Pulsar", "BH", "Nova", "dS*", "RRLyr", "Cepheid"),
+    "V*":  ("V*", "Mi*", "RRLyr", "Cepheid", "dS*", "LP*", "EB*", "RS*",
+            "BY*", "Nova", "Be*", "SR*", "CW*", "RR*", "a2*"),
     "G":   ("G", "GiG", "GiC", "GiP", "GiF", "Sy1", "Sy2", "AGN", "LINER",
             "LIN", "BLL", "QSO", "Bla", "EmG", "SBG", "bCG", "H2G", "LSB", "rG"),
     "HII": ("HII",),
@@ -359,12 +361,17 @@ def _parse_natural_language(query: str, limit: int):
     if m:
         limit = min(int(m.group(1)), 100)
 
-    # Detect object type (longest phrase first to avoid partial matches)
+    # Detect object type — regex first for variable stars (handles typos /
+    # plural variations like "variables stars", "variable", "variables"),
+    # then fall back to longest-phrase-first dict scan.
     detected_otype = None
-    for phrase, otype in sorted(_NL_OTYPE_MAP.items(), key=lambda x: -len(x[0])):
-        if phrase in q:
-            detected_otype = otype
-            break
+    if re.search(r'\bvariables?\b', q):
+        detected_otype = "V*"
+    if detected_otype is None:
+        for phrase, otype in sorted(_NL_OTYPE_MAP.items(), key=lambda x: -len(x[0])):
+            if phrase in q:
+                detected_otype = otype
+                break
 
     # Detect constellation — sort by name length descending so that longer
     # names (e.g. 'sagittarius') match before shorter substrings ('sagitta').
@@ -377,44 +384,75 @@ def _parse_natural_language(query: str, limit: int):
             detected_constellation = abbrev
             break
 
+    # Detect hemisphere
+    hemisphere = None
+    if re.search(r'north(?:ern)?\s+(?:sky|hemisphere)', q):
+        hemisphere = "north"
+    elif re.search(r'south(?:ern)?\s+(?:sky|hemisphere)', q):
+        hemisphere = "south"
+
     if detected_constellation:
         # If query says "bright* star*" but no otype was caught, default to stars
         if detected_otype is None and re.search(r'bright\w*\s+star', q):
             detected_otype = "*"
-        return ("constellation_objects", detected_otype, detected_constellation, limit)
+        return ("constellation_objects", detected_otype, detected_constellation, limit, hemisphere)
 
     # No constellation — global brightest stars shortcut
     if re.search(r'bright\w*\s+star', q):
-        return ("brightest_stars", None, None, limit)
+        return ("brightest_stars", detected_otype, None, limit, hemisphere)
 
-    return ("general", detected_otype, None, limit)
+    return ("general", detected_otype, None, limit, hemisphere)
 
 
 # ── SIMBAD queries ────────────────────────────────────────────────────────────
 
-def _query_brightest_stars(limit: int):
+def _query_brightest_stars(limit: int, otype_filter=None, hemisphere=None):
     """TAP: brightest stellar objects by V magnitude. Returns astropy Table."""
     from astroquery.simbad import Simbad
 
     # Over-fetch to allow filtering out non-stellar objects (galaxies etc.)
     fetch = min(limit * 5, 200)
+
+    # Relax magnitude ceiling for typed queries (e.g. variable stars span
+    # a wide range; the default 4.0 would exclude most of them).
+    mag_ceiling = 4.0 if not otype_filter else 8.0
+
+    # Build otype WHERE clause
+    if otype_filter and otype_filter in _OTYPE_GROUPS:
+        group_types = _OTYPE_GROUPS[otype_filter]
+        quoted = ", ".join(f"'{t}'" for t in group_types)
+        otype_clause = f"AND otype IN ({quoted})"
+    elif otype_filter and otype_filter != "*":
+        otype_clause = f"AND otype = '{otype_filter}'"
+    else:
+        otype_clause = ""
+
+    # Hemisphere filter
+    hem_clause = ""
+    if hemisphere == "north":
+        hem_clause = "AND dec > 0"
+    elif hemisphere == "south":
+        hem_clause = "AND dec < 0"
+
     adql = f"""SELECT TOP {fetch}
     main_id, otype, otype_txt, ra, dec, V AS vmag, ids
 FROM basic
 JOIN allfluxes ON allfluxes.oidref = basic.oid
 JOIN ids ON ids.oidref = basic.oid
-WHERE V IS NOT NULL AND V < 4.0
+WHERE V IS NOT NULL AND V < {mag_ceiling}
+{otype_clause}
+{hem_clause}
 ORDER BY vmag ASC"""
 
     table = Simbad.query_tap(adql)
     if table is None:
         return None
 
-    # Filter out non-stellar objects
+    # Post-filter non-stellar objects only when no specific otype was requested
     rows = []
     for row in table:
         otype = _safe_str(row['otype']) or ""
-        if otype not in _NON_STELLAR_OTYPES:
+        if otype_filter or otype not in _NON_STELLAR_OTYPES:
             rows.append(row)
         if len(rows) >= limit:
             break
@@ -578,7 +616,14 @@ def _query_general(otype_filter: Optional[str], limit: int):
     """General TAP query filtered by otype only."""
     from astroquery.simbad import Simbad
 
-    otype_clause = f"AND otype = '{otype_filter}'" if otype_filter else ""
+    if otype_filter and otype_filter in _OTYPE_GROUPS:
+        group_types = _OTYPE_GROUPS[otype_filter]
+        quoted = ", ".join(f"'{t}'" for t in group_types)
+        otype_clause = f"AND otype IN ({quoted})"
+    elif otype_filter:
+        otype_clause = f"AND otype = '{otype_filter}'"
+    else:
+        otype_clause = ""
     adql = f"""SELECT TOP {limit}
     main_id, otype, otype_txt, ra, dec, V AS vmag, ids
 FROM basic
@@ -661,20 +706,26 @@ async def simbad_search(query: str, limit: int = 10) -> str:
     """
     import asyncio
 
-    mode, otype_filter, constellation, limit = _parse_natural_language(query, limit)
+    mode, otype_filter, constellation, limit, hemisphere = _parse_natural_language(query, limit)
     limit = max(1, min(int(limit), 100))
 
     logger.info(
-        "SIMBAD search: mode=%s  otype=%s  constellation=%s  limit=%d",
-        mode, otype_filter, constellation, limit,
+        "SIMBAD search: mode=%s  otype=%s  constellation=%s  limit=%d  hemisphere=%s",
+        mode, otype_filter, constellation, limit, hemisphere,
     )
 
     loop = asyncio.get_event_loop()
 
     try:
         if mode == "brightest_stars":
-            title = f"The {limit} Brightest Stars in the Sky"
-            rows = await loop.run_in_executor(None, _query_brightest_stars, limit)
+            type_label = (_friendly_otype(otype_filter) + "s") if otype_filter and otype_filter != "*" else "Stars"
+            hem_label = (" in the Northern Sky" if hemisphere == "north"
+                         else " in the Southern Sky" if hemisphere == "south"
+                         else " in the Sky")
+            title = f"The {limit} Brightest {type_label}{hem_label}"
+            rows = await loop.run_in_executor(
+                None, lambda: _query_brightest_stars(limit, otype_filter, hemisphere)
+            )
 
         elif mode == "constellation_objects":
             const_name = _ABBREV_TO_FULL.get(constellation, constellation)

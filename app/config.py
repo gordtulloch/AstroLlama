@@ -17,7 +17,10 @@ class Settings(BaseSettings):
     default_system_prompt: str = (
         "You are a helpful astronomical assistant. "
         "Answer questions from your own training knowledge. "
-        "Answer concisely."
+        "Answer concisely. "
+        "When asked to show or generate a chart or map for any star, object, or constellation use generate_constellation_map. "
+        "Only use generate_aavso_map when the user explicitly asks for a variable star finder chart or an AAVSO chart for a known variable star such as Mira, SS Cyg, RR Lyr, Delta Cep, or similar. "
+        "Do not call generate_aavso_map for regular (non-variable) stars."
     )
     default_max_tokens: int = 1024
     default_context_size: int = 8192

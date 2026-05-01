@@ -1,5 +1,7 @@
 # AstroLlama
 
+![AstroLlama screenshot](static/readme%20screenshot.png)
+
 A local astronomical AI assistant built on [llama.cpp](https://github.com/ggerganov/llama.cpp). Features a FastAPI/web UI front-end, a Model Context Protocol (MCP) server with astronomical tools (SIMBAD lookups, constellation and AAVSO charts, astroquery integration), ChromaDB-backed RAG from local documents, local conversation persistence, and optional Microsoft Entra ID authentication.
 
 ## Architecture

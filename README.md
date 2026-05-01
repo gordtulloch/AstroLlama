@@ -1,95 +1,200 @@
 # AstroLlama
 
-Python client for llama.cpp with MCP support, local conversation persistence, and optional Microsoft Entra authentication using MSAL.
+A local astronomical AI assistant built on [llama.cpp](https://github.com/ggerganov/llama.cpp). Features a FastAPI/web UI front-end, a Model Context Protocol (MCP) server with astronomical tools (SIMBAD lookups, constellation and AAVSO charts, astroquery integration), ChromaDB-backed RAG from local documents, local conversation persistence, and optional Microsoft Entra ID authentication.
 
-## Quick start
+## Architecture
 
-1. Copy `.env.example` to `.env`.
-2. Start your llama.cpp server.
-3. Run `./run_client.ps1` (PowerShell).
-4. Open `http://127.0.0.1:8080`.
+| Component | Default port | Script |
+|-----------|-------------|--------|
+| llama.cpp inference server | 8081 | `run_llama.ps1` |
+| MCP astronomical-tools server | 8000 | `run_mcp.ps1` |
+| FastAPI web client | 8080 | `run_client.ps1` |
 
-## Microsoft Entra authentication (MSAL)
+## Requirements
 
-The app supports bearer-token auth for all `/api/*` endpoints. The web UI signs users in with `msal-browser` and sends access tokens to FastAPI. The backend validates JWT signatures against Entra JWKS.
+- **Python 3.11+** on PATH
+- **PowerShell 7+ (`pwsh`)** — required on macOS/Linux; PowerShell 5.1 works on Windows
+- **llama.cpp** binaries (`llama-server`) — place them in `ai/bin/` or set `LLAMA_CPP_PATH` in `.env`
+- A **GGUF model** file — place it in `ai/` or set `MODEL_PATH` in `.env`
+- *(Optional)* NVIDIA CUDA 12.x for GPU-accelerated inference
 
-### 1) Create the API app registration (resource)
+## Installation
 
-1. Go to Entra admin center > App registrations > New registration.
-2. Name it something like LocalAI Chat API.
-3. Keep supported account type to your org default.
-4. Register the app.
-5. Copy Application (client) ID. This is ENTRA_API_CLIENT_ID.
+### 1. Clone the repository
 
-### 2) Expose an API scope on the API app
+```bash
+git clone https://github.com/your-org/AstroLlama.git
+cd AstroLlama
+```
 
-1. Open the API app registration.
-2. Go to Expose an API.
-3. Set Application ID URI (typically api://<api-client-id>) if prompted.
-4. Add a scope:
-	- Scope name: access_as_user
-	- Who can consent: Admins and users (or your policy)
-5. Save scope.
-6. Build ENTRA_API_SCOPE as:
-	- api://<ENTRA_API_CLIENT_ID>/access_as_user
+### 2. Obtain llama.cpp binaries
 
-### 3) Create the SPA app registration (frontend)
+Download a pre-built release from the [llama.cpp releases page](https://github.com/ggerganov/llama.cpp/releases) or build from source, then either:
 
-1. Go to App registrations > New registration.
-2. Name it something like LocalAI Chat SPA.
-3. Register the app.
-4. Copy Application (client) ID. This is ENTRA_SPA_CLIENT_ID.
-5. Open Authentication:
-	- Add platform > Single-page application
-	- Redirect URI: http://127.0.0.1:8080
-6. This redirect URI value is ENTRA_REDIRECT_URI.
+- Copy the binaries into `ai/bin/`, **or**
+- Set the `LLAMA_CPP_PATH` variable in `.env` to the directory containing `llama-server`.
 
-### 4) Grant SPA permission to call the API
+### 3. Download a GGUF model
 
-1. Open SPA app registration > API permissions.
-2. Add a permission > My APIs > select your API app.
-3. Choose Delegated permissions and select access_as_user.
-4. Grant admin consent if required by tenant policy.
+Place a compatible GGUF model file in the `ai/` directory (example files are already listed there), **or** set `MODEL_PATH` in `.env` to its full path.
 
-### 5) Find tenant ID
+Tested models: `Llama-3.2-1B.Q8_0.gguf`, `Qwen2.5-3B-Instruct-Q8_0.gguf`, `mistral-7b-instruct-v0.2.Q3_K_M.gguf`.
 
-1. Go to Entra ID > Overview.
-2. Copy Tenant ID. This is ENTRA_TENANT_ID.
+### 4. Configure the environment
 
-### 6) Configure environment
+```powershell
+Copy-Item .env.example .env
+```
 
-Set these values in `.env`:
+Edit `.env` and set at minimum:
 
-- `ENTRA_AUTH_ENABLED=true`
-- `ENTRA_TENANT_ID=<tenant-guid>`
-- `ENTRA_SPA_CLIENT_ID=<spa-app-client-id>`
-- `ENTRA_API_CLIENT_ID=<api-app-client-id>`
-- `ENTRA_API_SCOPE=api://<api-app-client-id>/access_as_user`
-- `ENTRA_REDIRECT_URI=http://127.0.0.1:8080`
+| Variable | Description |
+|----------|-------------|
+| `LLAMA_CPP_PATH` | Directory containing `llama-server` (if not using `ai/bin/`) |
+| `MODEL_PATH` | Full path to the GGUF model file (if not in `ai/`) |
+| `HF_TOKEN` | Hugging Face token — needed for RAG embeddings ([get one free](https://huggingface.co/settings/tokens)) |
 
-If `ENTRA_AUTH_ENABLED=false`, auth is disabled and the app behaves as before.
+All other settings have working defaults. See `.env.example` for the full reference.
 
-### Variable mapping summary
+### 5. Create the Python virtual environment
 
-- ENTRA_TENANT_ID: Entra ID > Overview > Tenant ID
-- ENTRA_SPA_CLIENT_ID: SPA app registration > Overview > Application (client) ID
-- ENTRA_API_CLIENT_ID: API app registration > Overview > Application (client) ID
-- ENTRA_API_SCOPE: API app registration > Expose an API > created scope value
-- ENTRA_REDIRECT_URI: SPA app registration > Authentication > SPA redirect URI
+The run scripts create and populate the virtual environment automatically on first launch. To do it manually:
 
-### About client secret (Secret ID and Secret Value)
+```powershell
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+```
 
-- For this implementation, you do not need a client secret.
-- The browser uses MSAL public-client flow and obtains user delegated access tokens.
-- The backend only validates tokens; it does not exchange codes using a confidential client.
-- Do not place Secret ID or Secret Value in `.env` for this setup.
+## Running
 
-## API behavior
+### All-in-one (recommended)
 
-- `GET /api/auth/config` is public and provides auth bootstrap config for the SPA.
-- All other `/api/*` routes require a bearer token when auth is enabled.
+Starts llama-server, the MCP server, and the web client each in a separate terminal window:
 
-## Notes
+```powershell
+.\start.ps1
+```
 
-- This project remains local-first; host is `127.0.0.1` by default.
-- Keep `.env` out of source control.
+Optional flags:
+
+```powershell
+.\start.ps1 -LlamaPort 8082 -McpPort 8001 -ClientPort 9090
+.\start.ps1 -NoDelay   # skip the brief pause between component launches
+```
+
+Then open **http://127.0.0.1:8080** in your browser.
+
+### Individual components
+
+```powershell
+.\run_llama.ps1          # llama.cpp inference server (port 8081)
+.\run_mcp.ps1            # MCP astronomical-tools server (port 8000)
+.\run_client.ps1         # FastAPI web client (port 8080)
+.\run_client.ps1 -Reload # hot-reload mode for development
+```
+
+### Stop / restart
+
+```powershell
+.\stop.ps1       # gracefully stop all components
+.\restart.ps1    # stop then restart all components
+```
+
+### Linux / macOS
+
+Use the equivalent shell scripts:
+
+```bash
+./start.sh
+./stop.sh
+./restart.sh
+```
+
+## RAG — Indexing local documents
+
+The `data/documents/` directory is the default source for the ChromaDB vector store. Supported file types: `.txt`, `.md`, `.csv`, `.pdf`, `.docx`.
+
+```powershell
+# Index the default documents folder
+python scripts/ingest.py --source data/documents
+
+# Index a single file
+python scripts/ingest.py --source path/to/file.pdf
+
+# Clear the collection and re-index
+python scripts/ingest.py --source data/documents --clear
+
+# Crawl a website and ingest its content
+python scripts/web_ingest.py --url https://example.com --depth 2
+```
+
+RAG is enabled by default (`RAG_ENABLED=true`). Set `RAG_ENABLED=false` in `.env` to disable it.
+
+## MCP astronomical tools
+
+The MCP server exposes tools that the AI can call automatically:
+
+- **SIMBAD object lookup** — resolve names and retrieve object data
+- **Astroquery** — access CDS, VizieR, NED, and other archives
+- **Constellation maps** — generate star-field charts for any constellation or object
+- **AAVSO finder charts** — variable-star comparison charts
+- **Variable star comparison stars** — retrieve comparison star sequences
+
+MCP tool use is enabled by default (`MCP_ENABLED=true`). Set `MCP_ENABLED=false` in `.env` to disable it.
+
+## Microsoft Entra ID authentication (optional)
+
+AstroLlama supports protecting the web UI with Microsoft Entra ID (formerly Azure AD). To enable it:
+
+1. Create two Entra app registrations — one for the SPA front-end, one for the API.
+2. Fill in the corresponding variables in `.env`:
+
+```ini
+ENTRA_AUTH_ENABLED=true
+ENTRA_TENANT_ID=<your-tenant-id>
+ENTRA_SPA_CLIENT_ID=<spa-app-client-id>
+ENTRA_API_CLIENT_ID=<api-app-client-id>
+ENTRA_API_SCOPE=api://<ENTRA_API_CLIENT_ID>/access_as_user
+ENTRA_REDIRECT_URI=http://127.0.0.1:8080
+```
+
+See the comments in `.env.example` for where to find each value in the Azure portal.
+
+## Configuration reference
+
+All settings can be set in `.env`. Key options:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LLAMA_SERVER_URL` | `http://127.0.0.1:8081` | llama.cpp server URL |
+| `MCP_SERVER_URL` | `http://localhost:8000/mcp` | MCP server endpoint |
+| `APP_HOST` | `127.0.0.1` | Host the web client binds to |
+| `APP_PORT` | `8080` | Port the web client listens on |
+| `DEFAULT_MAX_TOKENS` | `1024` | Maximum tokens per response |
+| `DEFAULT_CONTEXT_SIZE` | `4096` | Context window size |
+| `RAG_ENABLED` | `true` | Enable ChromaDB retrieval-augmented generation |
+| `RAG_TOP_K` | `3` | Number of document chunks to retrieve |
+| `EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | Sentence-transformers embedding model |
+| `MCP_ENABLED` | `true` | Enable MCP tool calls |
+| `HF_TOKEN` | *(empty)* | Hugging Face API token for embeddings |
+| `ENTRA_AUTH_ENABLED` | `false` | Enable Microsoft Entra ID authentication |
+
+## Project structure
+
+```
+ai/              GGUF model files and llama.cpp binaries (ai/bin/)
+app/             FastAPI application (routers, services, models)
+data/
+  chromadb/      ChromaDB vector store
+  documents/     Source documents for RAG ingestion
+  conversations/ Persisted conversation history
+mcp_server/      MCP server and astronomical data-source modules
+scripts/         Document and web ingestion utilities
+static/          Web UI (HTML, CSS, JavaScript)
+tests/           Test suite
+```
+
+## License
+
+See [LICENSE](LICENSE).
+

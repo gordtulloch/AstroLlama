@@ -131,12 +131,19 @@ def _read_pdf_bytes(pdf_bytes: bytes, columns: int = 1) -> str:
 async def _fetch_pdf(url: str, session_cookies: dict | None = None) -> bytes | None:
     """Download a PDF URL and return raw bytes, reusing browser cookies if provided."""
     import httpx
+    from urllib.parse import urlsplit, urlunsplit, quote
+
+    # Percent-encode any spaces or non-ASCII characters in the path
+    parts = urlsplit(url)
+    encoded_url = urlunsplit(parts._replace(path=quote(parts.path, safe="/:@!$&'()*+,;=")))
 
     headers = {"User-Agent": "AstroLlama-RAG-Crawler/2.0"}
-    cookies = session_cookies or {}
+    # Pass cookies as a header string so httpx doesn't filter by domain
+    if session_cookies:
+        headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in session_cookies.items())
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
-            resp = await client.get(url, headers=headers, cookies=cookies)
+            resp = await client.get(encoded_url, headers=headers)
             resp.raise_for_status()
             ct = resp.headers.get("content-type", "")
             # Detect login-redirect: server returned HTML instead of PDF bytes
@@ -170,12 +177,17 @@ def _read_docx_bytes(docx_bytes: bytes) -> str:
 async def _fetch_docx(url: str, session_cookies: dict | None = None) -> bytes | None:
     """Download a .docx URL and return raw bytes, reusing browser cookies if provided."""
     import httpx
+    from urllib.parse import urlsplit, urlunsplit, quote
+
+    parts = urlsplit(url)
+    encoded_url = urlunsplit(parts._replace(path=quote(parts.path, safe="/:@!$&'()*+,;=")))
 
     headers = {"User-Agent": "AstroLlama-RAG-Crawler/2.0"}
-    cookies = session_cookies or {}
+    if session_cookies:
+        headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in session_cookies.items())
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
-            resp = await client.get(url, headers=headers, cookies=cookies)
+            resp = await client.get(encoded_url, headers=headers)
             resp.raise_for_status()
             ct = resp.headers.get("content-type", "")
             # Detect login-redirect: server returned HTML instead of docx bytes
@@ -330,7 +342,7 @@ async def _crawl(args: argparse.Namespace) -> list[tuple[str, str]]:
 
         async for result in await crawler.arun(args.url, config=run_config):
             if not result.success:
-                stats = getattr(result, "crawl_stats", {})
+                stats = getattr(result, "crawl_stats", None) or {}
                 # If a PDF URL somehow entered the BFS queue, rescue it
                 if args.pdf and result.url.lower().endswith(".pdf"):
                     logger.debug("Rescued PDF URL from failed crawl: %s", result.url)
@@ -364,15 +376,31 @@ async def _crawl(args: argparse.Namespace) -> list[tuple[str, str]]:
         # ---- Capture browser session cookies for authenticated file downloads
         if pdf_urls or docx_urls:
             try:
-                ctx = getattr(
-                    getattr(crawler, "crawler_strategy", None), "browser_context", None
+                strategy = getattr(crawler, "crawler_strategy", None)
+                bm = getattr(strategy, "browser_manager", None)
+                ctx = (
+                    getattr(bm, "default_context", None)
+                    # Fallbacks for older Crawl4AI versions
+                    or getattr(strategy, "browser_context", None)
+                    or getattr(strategy, "context", None)
+                    or getattr(strategy, "_context", None)
                 )
                 if ctx is not None:
                     raw_cookies = await ctx.cookies()
                     _browser_cookies = {c["name"]: c["value"] for c in raw_cookies}
-                    logger.debug("Captured %d browser cookies for PDF downloads", len(_browser_cookies))
+                    logger.info(
+                        "Captured %d browser cookie(s) for file downloads: %s",
+                        len(_browser_cookies),
+                        ", ".join(_browser_cookies.keys()) if _browser_cookies else "(none)",
+                    )
+                else:
+                    logger.warning(
+                        "Could not locate browser context on crawler strategy (%s) — "
+                        "authenticated file downloads may fail",
+                        type(strategy).__name__ if strategy else "None",
+                    )
             except Exception as exc:
-                logger.debug("Could not capture browser cookies: %s", exc)
+                logger.warning("Could not capture browser cookies: %s", exc)
 
     # ---- Download and extract PDFs ----------------------------------------
     if args.pdf and pdf_urls:
@@ -522,6 +550,20 @@ def main() -> None:
 
     pages = asyncio.run(_crawl(args))
 
+    # Deduplicate by URL — BFS can surface the same page from multiple parent links
+    seen_urls: set[str] = set()
+    deduped: list[tuple[str, str]] = []
+    for page_url, text in pages:
+        if page_url not in seen_urls:
+            seen_urls.add(page_url)
+            deduped.append((page_url, text))
+    if len(deduped) < len(pages):
+        logger.info(
+            "Deduplicated %d → %d page(s) (%d duplicate URL(s) removed)",
+            len(pages), len(deduped), len(pages) - len(deduped),
+        )
+    pages = deduped
+
     logger.info("Crawl complete — %d page(s) fetched", len(pages))
 
     if args.dry_run:
@@ -549,8 +591,31 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Ingest into ChromaDB
     # ------------------------------------------------------------------
+
+    # Build set of already-ingested source URLs so we can skip them (avoids
+    # redundant re-embedding on repeat runs without --clear).
+    already_ingested: set[str] = set()
+    if not args.clear:
+        try:
+            result = retriever._collection.get(include=["metadatas"])
+            for meta in result.get("metadatas") or []:
+                if meta and "source" in meta:
+                    already_ingested.add(meta["source"])
+            if already_ingested:
+                logger.info(
+                    "%d source(s) already in collection — will skip unchanged URLs",
+                    len(already_ingested),
+                )
+        except Exception as exc:
+            logger.debug("Could not fetch existing sources from ChromaDB: %s", exc)
+
     total_chunks = 0
+    skipped = 0
     for page_url, text in pages:
+        if page_url in already_ingested:
+            logger.debug("Skipping already-ingested %s", page_url)
+            skipped += 1
+            continue
         chunks = _chunk_text(text, args.chunk_size, args.chunk_overlap)
         if not chunks:
             continue
@@ -564,8 +629,10 @@ def main() -> None:
         logger.info("[html] %s → %d chunk(s)", page_url, len(chunks))
 
     logger.info(
-        "Ingestion complete — %d chunk(s) added (collection total: %d)",
+        "Ingestion complete — %d chunk(s) added, %d page(s) skipped (already ingested) "
+        "(collection total: %d)",
         total_chunks,
+        skipped,
         retriever.document_count,
     )
 

@@ -31,6 +31,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Silence verbose HTTP/browser library loggers
+for _noisy in ("httpx", "httpcore", "hpack", "playwright", "asyncio"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
 _REPO_ROOT = Path(__file__).parent.parent
 _SUPPORTED = {".txt", ".md", ".csv", ".pdf", ".docx"}
 
@@ -221,28 +225,36 @@ def main() -> None:
         action="store_true",
         help="Write extracted PDF text to data/documents/txt/ for inspection",
     )
+    parser.add_argument(
+        "--test-run",
+        action="store_true",
+        help="Extract and chunk as normal but write results to "
+             "data/test_run_ingest_<timestamp>.txt instead of ingesting into ChromaDB",
+    )
     args = parser.parse_args()
 
-    retriever = Retriever(
-        db_path=str(_REPO_ROOT / settings.chroma_db_path),
-        collection_name=settings.chroma_collection,
-        embedding_model=settings.embedding_model,
-        top_k=settings.rag_top_k,
-        hf_token=settings.hf_token,
-    )
-    retriever.start()
+    retriever = None
+    if not args.test_run:
+        retriever = Retriever(
+            db_path=str(_REPO_ROOT / settings.chroma_db_path),
+            collection_name=settings.chroma_collection,
+            embedding_model=settings.embedding_model,
+            top_k=settings.rag_top_k,
+            hf_token=settings.hf_token,
+        )
+        retriever.start()
 
-    if not retriever.available:
-        logger.error("ChromaDB could not be initialised — is chromadb installed?")
-        sys.exit(1)
+        if not retriever.available:
+            logger.error("ChromaDB could not be initialised — is chromadb installed?")
+            sys.exit(1)
 
-    if args.clear:
-        import chromadb
-        client = chromadb.PersistentClient(path=str(_REPO_ROOT / settings.chroma_db_path))
-        client.delete_collection(settings.chroma_collection)
-        retriever.start()  # recreate empty collection
-        logger.info("Collection cleared")
-        return
+        if args.clear:
+            import chromadb
+            client = chromadb.PersistentClient(path=str(_REPO_ROOT / settings.chroma_db_path))
+            client.delete_collection(settings.chroma_collection)
+            retriever.start()  # recreate empty collection
+            logger.info("Collection cleared")
+            return
 
     source = args.source.resolve()
     if not source.exists():
@@ -255,6 +267,52 @@ def main() -> None:
         logger.info("Column mode — each page will be split into %d vertical strip(s) for OCR", args.columns)
     if args.test:
         logger.info("Test mode — extracted PDF text will be written to data/documents/txt/")
+
+    if args.test_run:
+        import datetime
+        # Extract text from all source files and write to a single output file;
+        # do not touch ChromaDB at all.
+        source = args.source.resolve()
+        if not source.exists():
+            logger.error("Source path does not exist: %s", source)
+            sys.exit(1)
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = _REPO_ROOT / "data" / f"test_run_ingest_{ts}.txt"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        files: list[Path] = []
+        if source.is_dir():
+            for ext in _SUPPORTED:
+                files.extend(source.rglob(f"*{ext}"))
+        elif source.suffix in _SUPPORTED:
+            files = [source]
+        total_chunks = 0
+        with out_path.open("w", encoding="utf-8") as fh:
+            for file in files:
+                try:
+                    if file.suffix == ".pdf":
+                        text = _read_pdf(file, ocr=args.ocr, columns=args.columns)
+                    elif file.suffix == ".docx":
+                        text = _read_docx(file)
+                    else:
+                        text = file.read_text(encoding="utf-8", errors="replace")
+                except Exception as exc:
+                    logger.warning("Could not read %s: %s", file, exc)
+                    continue
+                chunks = _chunk_text(text, args.chunk_size, args.chunk_overlap)
+                if not chunks:
+                    continue
+                fh.write(f"{'='*80}\n")
+                fh.write(f"SOURCE: {file}\n")
+                fh.write(f"CHUNKS: {len(chunks)}\n")
+                fh.write(f"{'='*80}\n")
+                fh.write(text)
+                fh.write("\n\n")
+                total_chunks += len(chunks)
+                logger.info("Extracted %s \u2192 %d chunk(s)", file.name, len(chunks))
+        logger.info("Test run complete — %d chunk(s) from %d file(s) written to %s",
+                    total_chunks, len(files), out_path)
+        return
+
     count = ingest(
         source, retriever, args.chunk_size, args.chunk_overlap,
         ocr=args.ocr, columns=args.columns, dump_txt=args.test,

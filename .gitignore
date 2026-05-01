@@ -2,6 +2,7 @@
 *.gguf
 ai/*
 data/downloads/*
+duckdb-extensions/*
 
 # Downloaded datasets (keep .gitkeep for empty directories)
 *.parquet

@@ -16,7 +16,10 @@ class Settings(BaseSettings):
 
     default_system_prompt: str = (
         "You are a helpful astronomical assistant. "
-        "Answer questions from your own training knowledge. "
+        "Always prefer answering from your own training knowledge first. "
+        "If additional context has been provided from the local knowledge base, use it to answer. "
+        "Only call a tool when the user explicitly requests a live lookup, a chart, the current weather, "
+        "or current time — not simply because the topic is astronomical. "
         "Answer concisely. "
         "When asked to show or generate a chart or map for any star, object, or constellation use generate_constellation_map. "
         "Only use generate_aavso_map when the user explicitly asks for a variable star finder chart or an AAVSO chart for a known variable star such as Mira, SS Cyg, RR Lyr, Delta Cep, or similar. "

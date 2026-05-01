@@ -102,16 +102,6 @@ Then open **http://127.0.0.1:8080** in your browser.
 .\restart.ps1    # stop then restart all components
 ```
 
-### Linux / macOS
-
-Use the equivalent shell scripts:
-
-```bash
-./start.sh
-./stop.sh
-./restart.sh
-```
-
 ## RAG — Indexing local documents
 
 The `data/documents/` directory is the default source for the ChromaDB vector store. Supported file types: `.txt`, `.md`, `.csv`, `.pdf`, `.docx`.
@@ -126,24 +116,93 @@ python scripts/ingest.py --source path/to/file.pdf
 # Clear the collection and re-index
 python scripts/ingest.py --source data/documents --clear
 
-# Crawl a website and ingest its content (requires crawl4ai — see below)
-python scripts/web_ingest.py --url https://example.com --depth 2
+# OCR images embedded in PDF pages (requires Tesseract + pymupdf)
+python scripts/ingest.py --source data/documents --ocr
 
-# Limit pages, add a polite delay, or authenticate first
-python scripts/web_ingest.py --url https://example.com --depth 2 --max-pages 100 --delay 1.0
-python scripts/web_ingest.py --url https://members.example.com `
-    --login-url https://members.example.com/wp-login.php `
-    --username myuser --password mypassword
+# Two-column OCR layout (e.g. newsletters)
+python scripts/ingest.py --source data/documents --ocr --columns 2
+
+# Test extraction without writing to ChromaDB — output goes to data/test_run_ingest_<timestamp>.txt
+python scripts/ingest.py --source data/documents --test-run
 ```
 
-### Web crawling with Crawl4AI
+### `ingest.py` options
 
-`web_ingest.py` uses [Crawl4AI](https://docs.crawl4ai.com/) for headless-browser crawling. It handles JavaScript-rendered pages, single-page apps, and paywalled sites that Scrapy cannot reach. After installing dependencies, run the one-time browser setup:
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--source PATH` | `data/documents` | File or directory to ingest |
+| `--chunk-size N` | `500` | Characters per chunk |
+| `--chunk-overlap N` | `50` | Overlap between chunks |
+| `--clear` | off | Wipe the collection before ingesting |
+| `--ocr` | off | OCR images embedded in PDF pages |
+| `--columns N` | `1` | Vertical column splits per PDF page for OCR |
+| `--test` | off | Write extracted PDF text to `data/documents/txt/` |
+| `--test-run` | off | Extract and chunk without writing to ChromaDB; output saved to `data/test_run_ingest_<timestamp>.txt` |
+
+## RAG — Web crawling
+
+`web_ingest.py` uses [Crawl4AI](https://docs.crawl4ai.com/) for headless-browser crawling. It handles JavaScript-rendered pages, single-page apps, and paywalled sites. After installing dependencies run the one-time browser setup:
 
 ```powershell
 pip install crawl4ai
 crawl4ai-setup   # downloads Playwright Chromium binaries (~150 MB)
 ```
+
+### Basic usage
+
+```powershell
+# Crawl a public site (depth 3, no login)
+python scripts/web_ingest.py --url https://example.com --depth 2
+
+# Limit pages and add a polite delay
+python scripts/web_ingest.py --url https://example.com --depth 2 --max-pages 100 --delay 1.0
+
+# Authenticate before crawling (WordPress default field names)
+python scripts/web_ingest.py --url https://members.example.com `
+    --login-url https://members.example.com/wp-login.php `
+    --username myuser --password mypassword
+
+# Also download and ingest linked PDFs (with OCR for image pages)
+python scripts/web_ingest.py --url https://example.com --pdf --pdf-columns 2
+
+# Exclude URL patterns (repeatable)
+python scripts/web_ingest.py --url https://example.com `
+    --skip-url /wp-admin --skip-url /tag/ --skip-url /author/
+
+# Anti-bot: stealth mode + retries + proxy escalation
+python scripts/web_ingest.py --url https://protected.example.com `
+    --stealth --retries 2 `
+    --proxy http://user:pass@datacenter.example.com:8080 `
+    --proxy http://user:pass@residential.example.com:9090
+
+# Test extraction without writing to ChromaDB
+python scripts/web_ingest.py --url https://example.com --test-run
+```
+
+### `web_ingest.py` options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--url URL` | *(required)* | Start URL to crawl |
+| `--depth N` | `3` | Maximum crawl depth |
+| `--delay S` | `0.5` | Seconds to wait after each page load |
+| `--max-pages N` | `0` (unlimited) | Maximum pages to crawl |
+| `--chunk-size N` | `500` | Characters per chunk |
+| `--chunk-overlap N` | `50` | Overlap between chunks |
+| `--clear` | off | Wipe the ChromaDB collection before ingesting |
+| `--skip-url SUBSTR` | *(none)* | Exclude any URL containing this substring (repeatable) |
+| `--pdf` | off | Download and ingest PDF files linked from crawled pages |
+| `--pdf-columns N` | `1` | Column splits per PDF page for OCR (use `2` for newsletters) |
+| `--stealth` | off | Enable Playwright stealth mode and magic popup handling |
+| `--retries N` | `0` | Retry rounds when anti-bot blocking is detected |
+| `--proxy URL` | *(none)* | Proxy to escalate to after direct attempt fails (repeatable; cheapest first) |
+| `--login-url URL` | *(none)* | URL of the login page |
+| `--username STR` | *(none)* | Username for login |
+| `--password STR` | *(none)* | Password for login |
+| `--login-user-field NAME` | `log` | `name` attribute of the username input (WordPress default) |
+| `--login-pass-field NAME` | `pwd` | `name` attribute of the password input (WordPress default) |
+| `--dry-run` | off | Print page/chunk counts without writing to ChromaDB |
+| `--test-run` | off | Crawl and extract without writing to ChromaDB; output saved to `data/test_run_web_<timestamp>.txt` |
 
 RAG is enabled by default (`RAG_ENABLED=true`). Set `RAG_ENABLED=false` in `.env` to disable it.
 

@@ -131,11 +131,12 @@ def _read_pdf_bytes(pdf_bytes: bytes, columns: int = 1) -> str:
 async def _fetch_pdf(url: str, session_cookies: dict | None = None) -> bytes | None:
     """Download a PDF URL and return raw bytes, reusing browser cookies if provided."""
     import httpx
-    from urllib.parse import urlsplit, urlunsplit, quote
+    from urllib.parse import urlsplit, urlunsplit, quote, unquote
 
-    # Percent-encode any spaces or non-ASCII characters in the path
+    # Normalise: decode any existing percent-encoding then re-encode cleanly
+    # to avoid double-encoding (%20 → %2520).
     parts = urlsplit(url)
-    encoded_url = urlunsplit(parts._replace(path=quote(parts.path, safe="/:@!$&'()*+,;=")))
+    encoded_url = urlunsplit(parts._replace(path=quote(unquote(parts.path), safe="/:@!$&'()*+,;=")))
 
     headers = {"User-Agent": "AstroLlama-RAG-Crawler/2.0"}
     # Pass cookies as a header string so httpx doesn't filter by domain
@@ -146,11 +147,15 @@ async def _fetch_pdf(url: str, session_cookies: dict | None = None) -> bytes | N
             resp = await client.get(encoded_url, headers=headers)
             resp.raise_for_status()
             ct = resp.headers.get("content-type", "")
-            # Detect login-redirect: server returned HTML instead of PDF bytes
+            logger.info(
+                "PDF response: status=%d content-type=%r first-bytes=%r url=%s",
+                resp.status_code, ct, resp.content[:16], encoded_url,
+            )
+            # Detect server returning HTML instead of PDF bytes
             if "html" in ct or resp.content[:5] == b"<html":
                 logger.warning(
-                    "PDF URL returned HTML (likely auth redirect) for %s — cookies may be missing",
-                    url,
+                    "PDF URL returned HTML (status=%d, content-type=%r) for %s",
+                    resp.status_code, ct, url,
                 )
                 return None
             if "pdf" not in ct and not url.lower().endswith(".pdf"):
@@ -160,6 +165,52 @@ async def _fetch_pdf(url: str, session_cookies: dict | None = None) -> bytes | N
     except Exception as exc:
         logger.warning("Could not download PDF %s: %s", url, exc)
         return None
+
+
+async def _fetch_file_playwright(url: str, ctx) -> bytes | None:
+    """Download a file URL via Playwright's APIRequestContext.
+
+    This reuses the live browser session (cookies, TLS fingerprint, headers)
+    and bypasses bot-protection challenges that block plain httpx requests.
+    Falls back to httpx if the Playwright request fails.
+    """
+    from urllib.parse import urlsplit, urlunsplit, quote, unquote
+
+    # Normalise URL: decode then re-encode to avoid double-encoding
+    parts = urlsplit(url)
+    encoded_url = urlunsplit(parts._replace(path=quote(unquote(parts.path), safe="/:@!$&'()*+,;=")))
+
+    # `ctx` may be a Browser rather than a BrowserContext depending on
+    # which Crawl4AI attribute was resolved.  BrowserContext has .request;
+    # Browser does not but exposes .contexts.
+    browser_ctx = ctx
+    if not hasattr(ctx, "request"):
+        contexts = getattr(ctx, "contexts", [])
+        if contexts:
+            browser_ctx = contexts[0]
+            logger.debug("Resolved BrowserContext from Browser.contexts[0]")
+        else:
+            logger.warning("Cannot resolve a BrowserContext from %s — falling back to httpx", type(ctx).__name__)
+            return await _fetch_pdf(url, session_cookies=None)
+    try:
+        response = await browser_ctx.request.get(encoded_url)
+        body = await response.body()
+        ct = response.headers.get("content-type", "")
+        logger.info(
+            "File response (Playwright): status=%d content-type=%r first-bytes=%r",
+            response.status, ct, body[:16],
+        )
+        if "html" in ct or body[:5] == b"<html":
+            logger.warning("File URL returned HTML via Playwright for %s", url)
+            # Fall through to httpx fallback
+        else:
+            return body
+    except Exception as exc:
+        logger.warning("Playwright fetch failed for %s: %s — trying httpx", url, exc)
+
+    # httpx fallback (last resort)
+    return await _fetch_pdf(url, session_cookies=None)
+
 
 # ---------------------------------------------------------------------------
 # Docx extraction helpers (mirrors ingest.py)
@@ -331,6 +382,18 @@ async def _crawl(args: argparse.Namespace) -> list[tuple[str, str]]:
                 else:
                     logger.info("Login succeeded, proceeding with crawl")
                     _logged_in[0] = True
+                    # Capture cookies immediately while the context is guaranteed open
+                    try:
+                        ctx = context or page.context
+                        raw_cookies = await ctx.cookies()
+                        _browser_cookies.update({c["name"]: c["value"] for c in raw_cookies})
+                        logger.info(
+                            "Captured %d browser cookie(s) after login: %s",
+                            len(_browser_cookies),
+                            ", ".join(_browser_cookies.keys()),
+                        )
+                    except Exception as cookie_exc:
+                        logger.debug("Could not capture cookies in login hook: %s", cookie_exc)
             except Exception as exc:
                 logger.error("Login hook error: %s", exc)
             return page
@@ -373,74 +436,70 @@ async def _crawl(args: argparse.Namespace) -> list[tuple[str, str]]:
                     if args.docx and href.lower().endswith(".docx") and href not in docx_urls:
                         docx_urls.add(href)
 
-        # ---- Capture browser session cookies for authenticated file downloads
+        # ---- Locate the Playwright browser context for in-session file downloads
+        _playwright_ctx = None
         if pdf_urls or docx_urls:
             try:
                 strategy = getattr(crawler, "crawler_strategy", None)
                 bm = getattr(strategy, "browser_manager", None)
-                ctx = (
+                _playwright_ctx = (
                     getattr(bm, "default_context", None)
-                    # Fallbacks for older Crawl4AI versions
                     or getattr(strategy, "browser_context", None)
                     or getattr(strategy, "context", None)
                     or getattr(strategy, "_context", None)
                 )
-                if ctx is not None:
-                    raw_cookies = await ctx.cookies()
-                    _browser_cookies = {c["name"]: c["value"] for c in raw_cookies}
-                    logger.info(
-                        "Captured %d browser cookie(s) for file downloads: %s",
-                        len(_browser_cookies),
-                        ", ".join(_browser_cookies.keys()) if _browser_cookies else "(none)",
-                    )
+                if _playwright_ctx is not None:
+                    logger.info("Using Playwright browser context for file downloads")
                 else:
                     logger.warning(
-                        "Could not locate browser context on crawler strategy (%s) — "
-                        "authenticated file downloads may fail",
-                        type(strategy).__name__ if strategy else "None",
+                        "Could not locate Playwright browser context — falling back to httpx"
                     )
             except Exception as exc:
-                logger.warning("Could not capture browser cookies: %s", exc)
+                logger.warning("Could not locate browser context: %s — falling back to httpx", exc)
 
-    # ---- Download and extract PDFs ----------------------------------------
-    if args.pdf and pdf_urls:
-        logger.info("Downloading %d linked PDF(s)", len(pdf_urls))
-        for pdf_url in sorted(pdf_urls):
-            if args.skip_url and any(s in pdf_url for s in args.skip_url):
-                logger.debug("Skipping PDF %s (matches --skip-url filter)", pdf_url)
-                continue
-            logger.info("[pdf ] %s", pdf_url)
-            pdf_bytes = await _fetch_pdf(pdf_url, session_cookies=_browser_cookies)
-            if pdf_bytes is None:
-                continue
-            try:
-                text = _read_pdf_bytes(pdf_bytes, columns=args.pdf_columns)
-            except Exception as exc:
-                logger.warning("PDF extraction failed for %s: %s", pdf_url, exc)
-                continue
-            if text.strip():
-                pages.append((pdf_url, text))
-                logger.info("[pdf ] %s (%d chars)", pdf_url, len(text))
+        # ---- Download and extract PDFs (inside browser session) ---------------
+        if args.pdf and pdf_urls:
+            logger.info("Downloading %d linked PDF(s)", len(pdf_urls))
+            for pdf_url in sorted(pdf_urls):
+                if args.skip_url and any(s in pdf_url for s in args.skip_url):
+                    logger.debug("Skipping PDF %s (matches --skip-url filter)", pdf_url)
+                    continue
+                logger.info("[pdf ] %s", pdf_url)
+                pdf_bytes = await _fetch_file_playwright(pdf_url, _playwright_ctx) \
+                    if _playwright_ctx else \
+                    await _fetch_pdf(pdf_url, session_cookies=_browser_cookies)
+                if pdf_bytes is None:
+                    continue
+                try:
+                    text = _read_pdf_bytes(pdf_bytes, columns=args.pdf_columns)
+                except Exception as exc:
+                    logger.warning("PDF extraction failed for %s: %s", pdf_url, exc)
+                    continue
+                if text.strip():
+                    pages.append((pdf_url, text))
+                    logger.info("[pdf ] %s (%d chars)", pdf_url, len(text))
 
-    # ---- Download and extract Word documents --------------------------------
-    if args.docx and docx_urls:
-        logger.info("Downloading %d linked Word document(s)", len(docx_urls))
-        for docx_url in sorted(docx_urls):
-            if args.skip_url and any(s in docx_url for s in args.skip_url):
-                logger.debug("Skipping docx %s (matches --skip-url filter)", docx_url)
-                continue
-            logger.info("[docx] %s", docx_url)
-            docx_bytes = await _fetch_docx(docx_url, session_cookies=_browser_cookies)
-            if docx_bytes is None:
-                continue
-            try:
-                text = _read_docx_bytes(docx_bytes)
-            except Exception as exc:
-                logger.warning("Docx extraction failed for %s: %s", docx_url, exc)
-                continue
-            if text.strip():
-                pages.append((docx_url, text))
-                logger.info("[docx] %s (%d chars)", docx_url, len(text))
+        # ---- Download and extract Word documents (inside browser session) -----
+        if args.docx and docx_urls:
+            logger.info("Downloading %d linked Word document(s)", len(docx_urls))
+            for docx_url in sorted(docx_urls):
+                if args.skip_url and any(s in docx_url for s in args.skip_url):
+                    logger.debug("Skipping docx %s (matches --skip-url filter)", docx_url)
+                    continue
+                logger.info("[docx] %s", docx_url)
+                docx_bytes = await _fetch_file_playwright(docx_url, _playwright_ctx) \
+                    if _playwright_ctx else \
+                    await _fetch_docx(docx_url, session_cookies=_browser_cookies)
+                if docx_bytes is None:
+                    continue
+                try:
+                    text = _read_docx_bytes(docx_bytes)
+                except Exception as exc:
+                    logger.warning("Docx extraction failed for %s: %s", docx_url, exc)
+                    continue
+                if text.strip():
+                    pages.append((docx_url, text))
+                    logger.info("[docx] %s (%d chars)", docx_url, len(text))
 
     return pages
 

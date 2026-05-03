@@ -6,6 +6,7 @@ duckdb-extensions/*
 
 # Downloaded datasets (keep .gitkeep for empty directories)
 *.parquet
+*.bsp
 
 # IDEs
 # Keep .vscode/ workspace settings for Rust/Bevy development

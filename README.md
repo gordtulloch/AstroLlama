@@ -4,6 +4,8 @@
 
 A local astronomical AI assistant built on [llama.cpp](https://github.com/ggerganov/llama.cpp). Features a FastAPI/web UI front-end, a Model Context Protocol (MCP) server with astronomical tools (SIMBAD lookups, constellation and AAVSO charts, astroquery integration), ChromaDB-backed RAG from local documents, local conversation persistence, and optional Microsoft Entra ID authentication.
 
+The runtime stack now uses Docker Compose for all required servers.
+
 ## Architecture
 
 | Component | Default port | Script |
@@ -14,11 +16,10 @@ A local astronomical AI assistant built on [llama.cpp](https://github.com/ggerga
 
 ## Requirements
 
-- **Python 3.11+** on PATH
-- **PowerShell 7+ (`pwsh`)** — required on macOS/Linux; PowerShell 5.1 works on Windows
-- **llama.cpp** binaries (`llama-server`) — place them in `ai/bin/` or set `LLAMA_CPP_PATH` in `.env`
-- A **GGUF model** file — place it in `ai/` or set `MODEL_PATH` in `.env`
-- *(Optional)* NVIDIA CUDA 12.x for GPU-accelerated inference
+- **Docker Desktop** (or Docker Engine + Compose plugin)
+- **NVIDIA Container Toolkit** + recent NVIDIA drivers (for CUDA/GPU inference)
+- **PowerShell 7+ (`pwsh`)** for the helper scripts
+- A **GGUF model** file in `ai/` (default: `Llama-3.2-1B.Q8_0.gguf`)
 
 ## Installation
 
@@ -29,20 +30,13 @@ git clone https://github.com/your-org/AstroLlama.git
 cd AstroLlama
 ```
 
-### 2. Obtain llama.cpp binaries
-
-Download a pre-built release from the [llama.cpp releases page](https://github.com/ggerganov/llama.cpp/releases) or build from source, then either:
-
-- Copy the binaries into `ai/bin/`, **or**
-- Set the `LLAMA_CPP_PATH` variable in `.env` to the directory containing `llama-server`.
-
-### 3. Download a GGUF model
+### 2. Download a GGUF model
 
 Place a compatible GGUF model file in the `ai/` directory (example files are already listed there), **or** set `MODEL_PATH` in `.env` to its full path.
 
 Tested models: `Llama-3.2-1B.Q8_0.gguf`, `Qwen2.5-3B-Instruct-Q8_0.gguf`, `mistral-7b-instruct-v0.2.Q3_K_M.gguf`.
 
-### 4. Configure the environment
+### 3. Configure the environment
 
 ```powershell
 Copy-Item .env.example .env
@@ -52,26 +46,33 @@ Edit `.env` and set at minimum:
 
 | Variable | Description |
 |----------|-------------|
-| `LLAMA_CPP_PATH` | Directory containing `llama-server` (if not using `ai/bin/`) |
-| `MODEL_PATH` | Full path to the GGUF model file (if not in `ai/`) |
 | `HF_TOKEN` | Hugging Face token — needed for RAG embeddings ([get one free](https://huggingface.co/settings/tokens)) |
 
-All other settings have working defaults. See `.env.example` for the full reference.
+Optional Docker runtime overrides (used by `docker-compose.yml`):
 
-### 5. Create the Python virtual environment
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LLAMA_CPP_IMAGE` | `ghcr.io/ggerganov/llama.cpp:server-cuda` | CUDA-enabled llama.cpp server image |
+| `LLAMA_MODEL_FILE` | `Llama-3.2-1B.Q8_0.gguf` | Model file name under `./ai` |
+| `LLAMA_CTX_SIZE` | `8192` | llama.cpp context window |
+| `LLAMA_NGL` | `99` | Number of GPU layers |
+| `LLAMA_PORT` | `8081` | Host port mapped to llama service |
+| `MCP_PORT` | `8000` | Host port mapped to MCP service |
+| `APP_PORT` | `8080` | Host port mapped to FastAPI service |
 
-The run scripts create and populate the virtual environment automatically on first launch. To do it manually:
+All other settings have working defaults. See `.env.example` for application config reference.
+
+### 4. Verify Docker GPU access (recommended)
 
 ```powershell
-python -m venv .venv
-.venv\Scripts\pip install -r requirements.txt
+docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
 ```
 
 ## Running
 
 ### All-in-one (recommended)
 
-Starts llama-server, the MCP server, and the web client each in a separate terminal window:
+Starts llama.cpp (CUDA container), the MCP server, and the web client via Docker Compose:
 
 ```powershell
 .\start.ps1
@@ -81,25 +82,35 @@ Optional flags:
 
 ```powershell
 .\start.ps1 -LlamaPort 8082 -McpPort 8001 -ClientPort 9090
-.\start.ps1 -NoDelay   # skip the brief pause between component launches
 ```
 
 Then open **http://127.0.0.1:8080** in your browser.
 
+Equivalent raw Docker command:
+
+```powershell
+docker compose up -d --build
+```
+
 ### Individual components
 
 ```powershell
-.\run_llama.ps1          # llama.cpp inference server (port 8081)
-.\run_mcp.ps1            # MCP astronomical-tools server (port 8000)
-.\run_client.ps1         # FastAPI web client (port 8080)
-.\run_client.ps1 -Reload # hot-reload mode for development
+.\run_llama.ps1          # llama.cpp CUDA container (port 8081)
+.\run_mcp.ps1            # MCP container (port 8000)
+.\run_client.ps1         # FastAPI container (port 8080)
+```
+
+Tail logs:
+
+```powershell
+docker compose logs -f
 ```
 
 ### Stop / restart
 
 ```powershell
-.\stop.ps1       # gracefully stop all components
-.\restart.ps1    # stop then restart all components
+.\stop.ps1       # docker compose down --remove-orphans
+.\restart.ps1    # docker compose down + up -d --build
 ```
 
 ## RAG — Indexing local documents

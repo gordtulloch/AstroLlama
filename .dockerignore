@@ -1,0 +1,21 @@
+.git
+.gitignore
+.venv
+__pycache__/
+**/__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+ai/*.gguf
+ai/*.bin
+ai/*.safetensors
+
+data/chromadb/
+data/conversations/
+data/downloads/
+logs/
+
+static/readme screenshot.png

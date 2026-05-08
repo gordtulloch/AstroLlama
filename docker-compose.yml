@@ -1,0 +1,83 @@
+services:
+  llama:
+    image: ${LLAMA_CPP_IMAGE:-ghcr.io/ggml-org/llama.cpp:server-cuda}
+    container_name: astrollama-llama
+    restart: unless-stopped
+    gpus: all
+    ports:
+      - "${LLAMA_PORT:-8081}:8081"
+    volumes:
+      - ./ai:/models:ro
+    command:
+      - "-m"
+      - "/models/${LLAMA_MODEL_FILE:-Llama-3.2-1B.Q8_0.gguf}"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8081"
+      - "--ctx-size"
+      - "${LLAMA_CTX_SIZE:-8192}"
+      - "--flash-attn"
+      - "auto"
+      - "-ngl"
+      - "${LLAMA_NGL:-99}"
+
+  mcp:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.python-services
+    container_name: astrollama-mcp
+    restart: unless-stopped
+    working_dir: /app
+    command:
+      - python
+      - -m
+      - mcp_server.server
+      - --http
+      - "8000"
+    ports:
+      - "${MCP_PORT:-8000}:8000"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./mcp_server:/app/mcp_server
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.create_connection(('127.0.0.1',8000), 2); s.close()"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 10s
+
+  app:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.python-services
+    container_name: astrollama-app
+    restart: unless-stopped
+    working_dir: /app
+    command:
+      - python
+      - -m
+      - uvicorn
+      - app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+    depends_on:
+      - llama
+      - mcp
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    environment:
+      LLAMA_SERVER_URL: http://llama:8081
+      MCP_SERVER_URL: http://mcp:8000/mcp
+      APP_HOST: 0.0.0.0
+      APP_PORT: 8080
+    volumes:
+      - ./app:/app/app
+      - ./static:/app/static
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./mcp_server:/app/mcp_server
+      - ./scripts:/app/scripts

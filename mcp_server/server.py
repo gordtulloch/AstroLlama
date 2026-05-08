@@ -41,20 +41,27 @@ def _tools_dir() -> Path:
     return Path(__file__).resolve().parent / "tools"
 
 
-def _is_atomic_tool_filename(py_file: Path) -> bool:
-    """Return True only for files that follow the atomic tool naming convention."""
-    return py_file.name.endswith("_tool.py")
+def _iter_root_tool_files() -> list[Path]:
+    """Return only top-level Python tool files (no subfolders)."""
+    folder = _tools_dir()
+    if not folder.exists():
+        return []
+    files: list[Path] = []
+    for entry in sorted(folder.iterdir()):
+        if not entry.is_file():
+            continue
+        if entry.suffix != ".py":
+            continue
+        if entry.name in {"__init__.py", "openwebui_adapter.py"}:
+            continue
+        files.append(entry)
+    return files
 
 
 def _tools_fingerprint() -> tuple[tuple[str, int], ...]:
     """Return a lightweight fingerprint of tool files for hot-reload checks."""
-    folder = _tools_dir()
-    if not folder.exists():
-        return tuple()
     rows: list[tuple[str, int]] = []
-    for py_file in sorted(folder.glob("*.py")):
-        if py_file.name in {"__init__.py", "openwebui_adapter.py"}:
-            continue
+    for py_file in _iter_root_tool_files():
         try:
             mtime_ns = py_file.stat().st_mtime_ns
         except OSError:
@@ -88,9 +95,11 @@ def _instantiate_tools_class(module_name: str, module_obj: Any) -> Any | None:
 def _build_openwebui_tool_registry() -> tuple[dict[str, Any], list[types.Tool], dict[str, Any]]:
     """Build OpenWebUI-compatible tool specs and their MCP schema projection."""
     try:
-        from .tools.openwebui_adapter import build_tool_specs, specs_to_mcp_tools
+        from .tools.openwebui_adapter import build_tool_specs, specs_to_mcp_tools, install_openwebui_shims
     except ImportError:
-        from tools.openwebui_adapter import build_tool_specs, specs_to_mcp_tools
+        from tools.openwebui_adapter import build_tool_specs, specs_to_mcp_tools, install_openwebui_shims
+
+    install_openwebui_shims(Path(__file__).resolve().parent.parent / "data" / "downloads")
 
     module_names_env = os.environ.get("OWUI_TOOLS_MODULES", "").strip()
     modules: list[tuple[str, Any]] = []
@@ -102,15 +111,7 @@ def _build_openwebui_tool_registry() -> tuple[dict[str, Any], list[types.Tool], 
             except Exception as exc:
                 logger.warning("Skipping OWUI module %s: %s", raw_name, exc)
     else:
-        for py_file in sorted(_tools_dir().glob("*.py")):
-            if py_file.name in {"__init__.py", "openwebui_adapter.py"}:
-                continue
-            if not _is_atomic_tool_filename(py_file):
-                logger.warning(
-                    "Skipping tool file %s: filename must match '*_tool.py' for atomic discovery",
-                    py_file.name,
-                )
-                continue
+        for py_file in _iter_root_tool_files():
             try:
                 mod = _load_module_from_file(py_file)
                 modules.append((py_file.stem, mod))
@@ -131,15 +132,6 @@ def _build_openwebui_tool_registry() -> tuple[dict[str, Any], list[types.Tool], 
 
         tools_objects[module_name] = tools_obj
         module_specs = build_tool_specs(tools_obj)
-
-        if len(module_specs) != 1:
-            logger.warning(
-                "Skipping tools module %s: expected exactly one public tool method, found %d",
-                module_name,
-                len(module_specs),
-            )
-            tools_objects.pop(module_name, None)
-            continue
 
         for tool_name, spec in module_specs.items():
             if tool_name in merged_specs:

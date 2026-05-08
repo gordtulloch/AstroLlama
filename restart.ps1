@@ -1,182 +1,36 @@
 #!/usr/bin/env pwsh
-<#
-.SYNOPSIS
-    Restart all AstroLlama components.
-
-.DESCRIPTION
-    Stops any running llama-server, MCP server, and FastAPI client processes,
-    then relaunches them via start.ps1 in separate windows.
-
-.PARAMETER RepoRoot
-    Path to the repository root.  Defaults to the directory containing this script.
-
-.PARAMETER LlamaPort
-    Port for the llama-server.  Defaults to 8081.
-
-.PARAMETER McpPort
-    Port for the MCP server.  Defaults to 8000.
-
-.PARAMETER ClientPort
-    Port for the FastAPI client.  Defaults to 8080.
-
-.PARAMETER NoDelay
-    Skip the brief pause between launching each component.
-
-.EXAMPLE
-    .\restart.ps1
-    .\restart.ps1 -LlamaPort 8082
-#>
 param(
-    [string]$RepoRoot  = $PSScriptRoot,
-    [int]$LlamaPort    = 8081,
-    [int]$McpPort      = 8000,
-    [int]$ClientPort   = 8080,
-    [switch]$NoDelay
+    [string]$RepoRoot = $PSScriptRoot,
+    [int]$LlamaPort = 8081,
+    [int]$McpPort = 8000,
+    [int]$ClientPort = 8080
 )
 
 $ErrorActionPreference = "Stop"
+Set-Location $RepoRoot
 
-# ---------------------------------------------------------------------------
-# Helper: stop processes matching a WMI/CIM command-line substring.
-# Returns the count of processes killed.
-# ---------------------------------------------------------------------------
-function Stop-ByCommandLine {
-    param(
-        [string]$Match,
-        [string]$Label
-    )
-
-    $killed = 0
-
-    if ($IsWindows -or $env:OS -eq "Windows_NT") {
-        $procs = Get-CimInstance Win32_Process |
-            Where-Object { $_.CommandLine -and $_.CommandLine -like "*$Match*" }
-        foreach ($p in $procs) {
-            try {
-                Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
-                $killed++
-            } catch { }
-        }
-    } else {
-        # macOS / Linux — use pgrep / pkill
-        $pids = & pgrep -f ([regex]::Escape($Match)) 2>/dev/null
-        foreach ($pid in $pids) {
-            if ($pid) {
-                & kill -TERM $pid 2>/dev/null
-                $killed++
-            }
-        }
-    }
-
-    if ($killed -gt 0) {
-        Write-Host "  Stopped $killed $Label process(es)." -ForegroundColor DarkYellow
-    } else {
-        Write-Host "  No running $Label processes found." -ForegroundColor DarkGray
-    }
-
-    return $killed
+if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+    throw "Docker CLI not found. Install Docker Desktop and ensure 'docker' is on PATH."
 }
 
-# ---------------------------------------------------------------------------
-# Helper: stop all processes with a given executable name (Windows exe name).
-# ---------------------------------------------------------------------------
-function Stop-ByName {
-    param(
-        [string]$WinName,
-        [string]$UnixMatch,
-        [string]$Label
-    )
+$env:LLAMA_PORT = $LlamaPort.ToString()
+$env:MCP_PORT = $McpPort.ToString()
+$env:APP_PORT = $ClientPort.ToString()
 
-    $killed = 0
-
-    if ($IsWindows -or $env:OS -eq "Windows_NT") {
-        $procs = Get-Process -Name $WinName -ErrorAction SilentlyContinue
-        foreach ($p in $procs) {
-            try { $p | Stop-Process -Force; $killed++ } catch { }
-        }
-    } else {
-        $pids = & pgrep -f ([regex]::Escape($UnixMatch)) 2>/dev/null
-        foreach ($pid in $pids) {
-            if ($pid) { & kill -TERM $pid 2>/dev/null; $killed++ }
-        }
-    }
-
-    if ($killed -gt 0) {
-        Write-Host "  Stopped $killed $Label process(es)." -ForegroundColor DarkYellow
-    } else {
-        Write-Host "  No running $Label processes found." -ForegroundColor DarkGray
-    }
-
-    return $killed
-}
-
-# ---------------------------------------------------------------------------
-# Helper: stop any process listening on a given port (fallback for -m module launches)
-# ---------------------------------------------------------------------------
-function Stop-ByPort {
-    param([int]$Port, [string]$Label)
-    $killed = 0
-    $pids = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
-        Select-Object -ExpandProperty OwningProcess -Unique
-    foreach ($pid in $pids) {
-        try { Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue; $killed++ } catch { }
-    }
-    if ($killed -gt 0) {
-        Write-Host "  Stopped $killed $Label process(es) on port $Port." -ForegroundColor DarkYellow
-    } else {
-        Write-Host "  No $Label process found on port $Port." -ForegroundColor DarkGray
-    }
-    return $killed
-}
-
-# ---------------------------------------------------------------------------
-# Stop phase
-# ---------------------------------------------------------------------------
 Write-Host ""
-Write-Host "  AstroLlama Restart" -ForegroundColor Cyan
-Write-Host "  ==================" -ForegroundColor Cyan
-Write-Host ""
-Write-Host "  Stopping components ..." -ForegroundColor Yellow
+Write-Host "  AstroLlama Docker Restart" -ForegroundColor Cyan
+Write-Host "  ========================" -ForegroundColor Cyan
 Write-Host ""
 
-# llama-server (native binary)
-$null = Stop-ByName -WinName "llama-server" -UnixMatch "llama-server" -Label "llama-server"
+docker compose down --remove-orphans
+if ($LASTEXITCODE -ne 0) { throw "docker compose down failed" }
 
-# MCP server (Python running mcp_server/server.py or -m mcp_server.server)
-$null = Stop-ByCommandLine -Match "mcp_server/server.py"  -Label "MCP server"
-$null = Stop-ByCommandLine -Match "mcp_server\server.py"  -Label "MCP server"  # Windows path variant
-$null = Stop-ByCommandLine -Match "mcp_server.server"     -Label "MCP server (module)"  # -m mcp_server.server
-$null = Stop-ByPort        -Port 8000                     -Label "MCP server (port 8000)"  # fallback: kill by port
+docker compose up -d --build
+if ($LASTEXITCODE -ne 0) { throw "docker compose up failed" }
 
-# FastAPI / uvicorn client (app.main:app)
-$null = Stop-ByCommandLine -Match "app.main:app" -Label "FastAPI client"
-
-# Close the PowerShell host windows opened by start.ps1 (-NoExit).
-$null = Stop-ByCommandLine -Match "run_llama.ps1"   -Label "llama-server window"
-$null = Stop-ByCommandLine -Match "run_mcp.ps1"     -Label "MCP server window"
-$null = Stop-ByCommandLine -Match "run_client.ps1"  -Label "client window"
-
-# Give OS a moment to release ports before restarting.
 Write-Host ""
-Write-Host "  Waiting for ports to be released ..." -ForegroundColor DarkGray
-Start-Sleep -Seconds 2
-
-# ---------------------------------------------------------------------------
-# Restart phase — delegate to start.ps1
-# ---------------------------------------------------------------------------
-$StartScript = Join-Path $RepoRoot "start.ps1"
-if (-not (Test-Path $StartScript)) {
-    throw "start.ps1 not found at: $StartScript"
-}
-
-Write-Host "  Launching components ..." -ForegroundColor Yellow
+Write-Host "  Services restarted:" -ForegroundColor Green
+Write-Host "  llama:  http://localhost:${LlamaPort}" -ForegroundColor Green
+Write-Host "  mcp:    http://localhost:${McpPort}/mcp" -ForegroundColor Green
+Write-Host "  client: http://localhost:${ClientPort}" -ForegroundColor Green
 Write-Host ""
-
-$startArgs = @{
-    LlamaPort  = $LlamaPort
-    McpPort    = $McpPort
-    ClientPort = $ClientPort
-}
-if ($NoDelay) { $startArgs['NoDelay'] = $true }
-
-& $StartScript @startArgs

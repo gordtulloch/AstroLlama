@@ -347,6 +347,119 @@ def _safe_str(val) -> Optional[str]:
     return s if s and s.lower() not in ("nan", "--", "none", "") else None
 
 
+def _normalize_single_object_query(query: str) -> list[str]:
+    """
+    Build candidate SIMBAD identifiers for a single-object lookup.
+
+    Handles compact catalog names like NGC1015 / IC342 / M42 and strips
+    common punctuation from natural-language phrasing.
+    """
+    raw = re.sub(r"\s+", " ", str(query or "")).strip()
+    if not raw:
+        return []
+
+    cleaned = raw.strip(" \t\r\n?!.:,;\"'()[]{}")
+    candidates: list[str] = []
+
+    # Pull out a likely catalog token from full phrases when present.
+    token_match = re.search(r"\b((?:NGC|IC|M)\s*-?\s*\d{1,5})\b", cleaned, re.IGNORECASE)
+    if token_match:
+        cleaned = token_match.group(1)
+
+    candidates.append(cleaned)
+
+    # Normalized catalog spacing variants (e.g. NGC1015 <-> NGC 1015).
+    cat_match = re.match(r"^(NGC|IC|M)\s*-?\s*(\d{1,5})$", cleaned, re.IGNORECASE)
+    if cat_match:
+        prefix = cat_match.group(1).upper()
+        number = str(int(cat_match.group(2)))
+        candidates.extend([f"{prefix} {number}", f"{prefix}{number}"])
+
+    unique: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        normalized = re.sub(r"\s+", " ", candidate).strip()
+        if not normalized:
+            continue
+        key = normalized.upper()
+        if key not in seen:
+            seen.add(key)
+            unique.append(normalized)
+    return unique
+
+
+def _query_single_object(object_name: str):
+    """Resolve a single object by identifier/name and return (row, matched_query)."""
+    from astroquery.simbad import Simbad
+
+    query_candidates = _normalize_single_object_query(object_name)
+    if not query_candidates:
+        return None, None
+
+    sim = Simbad()
+    sim.add_votable_fields("otype", "otype_txt", "flux(V)", "ids", "ra(d)", "dec(d)")
+
+    for candidate in query_candidates:
+        table = sim.query_object(candidate)
+        if table is not None and len(table) > 0:
+            return table[0], candidate
+    return None, None
+
+
+def _format_single_object(row, requested_name: str, matched_name: str) -> str:
+    """Format a single-object lookup result with coordinates and core metadata."""
+    main_id = _safe_str(row["main_id"]) or matched_name or requested_name
+    otype = _safe_str(row["otype"]) or ""
+    otype_txt = _safe_str(row["otype_txt"]) or ""
+    ids_str = _safe_str(row["ids"]) or ""
+
+    # Prefer decimal coordinates when available, but fall back to standard RA/Dec strings.
+    ra_deg = _safe_str(row["ra_d"]) if "ra_d" in row.colnames else None
+    dec_deg = _safe_str(row["dec_d"]) if "dec_d" in row.colnames else None
+    ra_std = _safe_str(row["ra"]) if "ra" in row.colnames else None
+    dec_std = _safe_str(row["dec"]) if "dec" in row.colnames else None
+    vmag = _safe_str(row["flux_V"]) if "flux_V" in row.colnames else None
+
+    display_name = _pick_common_name(main_id, ids_str)
+    type_label = _friendly_otype(otype, otype_txt)
+
+    lines = [
+        f"Single Object Lookup: {requested_name}",
+        "=" * (22 + len(str(requested_name or ""))),
+        "",
+        f"Name: {display_name}",
+        f"SIMBAD ID: {main_id}",
+        f"Type: {type_label}",
+    ]
+
+    if vmag:
+        mag_desc = _mag_description(vmag)
+        if mag_desc:
+            lines.append(f"Brightness: {mag_desc}")
+
+    if ra_deg and dec_deg:
+        try:
+            ra_f = float(ra_deg)
+            dec_f = float(dec_deg)
+            hemisphere = "north" if dec_f >= 0 else "south"
+            lines.append(f"Coordinates (ICRS): RA {ra_f:.6f}°, Dec {dec_f:+.6f}° ({hemisphere}ern sky)")
+        except (TypeError, ValueError):
+            pass
+    elif ra_std and dec_std:
+        lines.append(f"Coordinates (ICRS): RA {ra_std}, Dec {dec_std}")
+
+    if ids_str:
+        aliases = [a.strip() for a in ids_str.split("|") if a.strip()]
+        if aliases:
+            lines.append(f"Aliases: {', '.join(aliases[:6])}")
+
+    lines.extend([
+        "",
+        "Source: SIMBAD Astronomical Database (simbad.u-strasbg.fr)",
+    ])
+    return "\n".join(lines)
+
+
 # ── Natural-language query parser ─────────────────────────────────────────────
 def _parse_natural_language(query: str, limit: int):
     """
@@ -752,5 +865,31 @@ async def simbad_search(query: str, limit: int = 10) -> str:
         return f'No results found for: "{query}"'
 
     return _format_rows(rows, title)
+
+
+async def simbad_lookup_object(object_name: str) -> str:
+    """
+    Resolve a single astronomical object by name/identifier and return
+    coordinates and key metadata.
+    """
+    import asyncio
+
+    normalized = str(object_name or "").strip()
+    if not normalized:
+        return "Please provide an object name, for example: NGC 1015"
+
+    logger.info("SIMBAD single-object lookup: object=%s", normalized)
+    loop = asyncio.get_event_loop()
+
+    try:
+        row, matched = await loop.run_in_executor(None, _query_single_object, normalized)
+    except Exception as exc:
+        logger.error("SIMBAD single-object lookup failed: %s", exc, exc_info=True)
+        return f"Sorry, the SIMBAD lookup could not be completed: {exc}"
+
+    if row is None:
+        return f'No SIMBAD object found for: "{normalized}"'
+
+    return _format_single_object(row, normalized, matched or normalized)
 
 

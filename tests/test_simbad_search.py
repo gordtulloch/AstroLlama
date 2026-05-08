@@ -23,6 +23,7 @@ from mcp_server.data_sources.simbad_search import (
     _pick_common_name,
     _mag_description,
     _safe_str,
+    _normalize_single_object_query,
     _parse_natural_language,
     _format_rows,
     _OTYPE_LABELS,
@@ -288,6 +289,30 @@ class TestSafeStr:
             mask = False
             def __str__(self): return "Betelgeuse"
         assert _safe_str(FakeUnmasked()) == "Betelgeuse"
+
+
+# ---------------------------------------------------------------------------
+# _normalize_single_object_query
+# ---------------------------------------------------------------------------
+
+class TestNormalizeSingleObjectQuery:
+
+    def test_compact_ngc_variant_expands(self):
+        variants = _normalize_single_object_query("NGC1015")
+        assert "NGC1015" in variants
+        assert "NGC 1015" in variants
+
+    def test_spaced_messier_variant_expands(self):
+        variants = _normalize_single_object_query("M 42")
+        assert "M 42" in variants
+        assert "M42" in variants
+
+    def test_extracts_catalog_token_from_phrase(self):
+        variants = _normalize_single_object_query("What are the coordinates for NGC1015?")
+        assert variants[0].upper() in ("NGC1015", "NGC 1015")
+
+    def test_empty_query_returns_empty_list(self):
+        assert _normalize_single_object_query("") == []
 
 
 # ---------------------------------------------------------------------------

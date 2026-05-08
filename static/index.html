@@ -14,7 +14,12 @@
     <aside id="sidebar">
       <div id="sidebar-header">
         <div id="sidebar-brand">
-          <img id="sidebar-logo" src="astrollama.png" alt="Astrollama Logo" />
+          <div id="sidebar-pulse" class="pulse-idle" aria-hidden="true">
+            <div class="pulse-core"></div>
+            <div class="pulse-ring pulse-ring-a"></div>
+            <div class="pulse-ring pulse-ring-b"></div>
+            <div class="pulse-ring pulse-ring-c"></div>
+          </div>
           <span id="brand-name">AstroLlama</span>
         </div>
       </div>
@@ -38,6 +43,7 @@
       <div id="sidebar-footer">
         <button id="btn-new-chat" title="New conversation">&#43; New</button>
         <button id="btn-save-conv" title="Save current conversation">&#128190; Save</button>
+        <img id="sidebar-logo-footer" src="astrollama.png" alt="AstroLlama Logo" />
       </div>
     </aside>
 
@@ -54,6 +60,8 @@
         ></textarea>
         <div id="input-controls">
           <button id="btn-send" class="btn-primary">Send</button>
+          <button id="btn-mic" class="btn-secondary" title="Start voice input" aria-pressed="false">Mic</button>
+          <button id="btn-tts" class="btn-secondary" title="Toggle read-aloud" aria-pressed="false">Voice Off</button>
           <button id="btn-cancel" class="btn-danger" disabled>Cancel</button>
           <details id="settings-panel">
             <summary>&#9881; Settings</summary>
@@ -70,6 +78,23 @@
               <label class="full-width">System prompt
                 <textarea id="s-system_prompt" rows="3" placeholder="(optional)"></textarea>
               </label>
+              <label class="full-width">Voice
+                <select id="s-voice"></select>
+              </label>
+              <label>Voice speed
+                <input type="number" id="s-voice-rate" min="0.7" max="1.25" step="0.05" value="0.95" />
+              </label>
+              <label>Voice pitch
+                <input type="number" id="s-voice-pitch" min="0.8" max="1.2" step="0.05" value="1.0" />
+              </label>
+              <label>
+                Preview
+                <button type="button" id="btn-voice-preview" class="btn-secondary">Test Voice</button>
+              </label>
+              <label class="full-width">
+                <input type="checkbox" id="s-reactive-orb" checked />
+                Mic-reactive orb while speaking
+              </label>
             </div>
           </details>
         </div>
@@ -79,6 +104,6 @@
 
   <!-- MSAL is loaded dynamically by app.js with fallback CDN support -->
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-  <script src="app.js?v=20260425c"></script>
+  <script src="app.js?v=20260507c"></script>
 </body>
 </html>

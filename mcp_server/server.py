@@ -7,6 +7,11 @@ AstroLlamaMCP Server
 import asyncio
 import logging
 import argparse
+import importlib
+import importlib.util
+import os
+import sys
+from pathlib import Path
 from typing import Any
 import json
 
@@ -26,6 +31,147 @@ logger = logging.getLogger(__name__)
 # Initialize server
 server = Server("mcp-server")
 
+_OWUI_TOOL_SPECS = None
+_OWUI_MCP_TOOLS: list[types.Tool] | None = None
+_OWUI_TOOLS_OBJ: dict[str, Any] | None = None
+_OWUI_TOOLS_FINGERPRINT: tuple[tuple[str, int], ...] | None = None
+
+
+def _tools_dir() -> Path:
+    return Path(__file__).resolve().parent / "tools"
+
+
+def _is_atomic_tool_filename(py_file: Path) -> bool:
+    """Return True only for files that follow the atomic tool naming convention."""
+    return py_file.name.endswith("_tool.py")
+
+
+def _tools_fingerprint() -> tuple[tuple[str, int], ...]:
+    """Return a lightweight fingerprint of tool files for hot-reload checks."""
+    folder = _tools_dir()
+    if not folder.exists():
+        return tuple()
+    rows: list[tuple[str, int]] = []
+    for py_file in sorted(folder.glob("*.py")):
+        if py_file.name in {"__init__.py", "openwebui_adapter.py"}:
+            continue
+        try:
+            mtime_ns = py_file.stat().st_mtime_ns
+        except OSError:
+            mtime_ns = 0
+        rows.append((py_file.name, mtime_ns))
+    return tuple(rows)
+
+
+def _load_module_from_file(py_file: Path):
+    """Load (or reload) a Python module from a tools/*.py file path."""
+    module_name = f"mcp_server.tools.dynamic_{py_file.stem}_{int(py_file.stat().st_mtime_ns)}"
+    spec = importlib.util.spec_from_file_location(module_name, py_file)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Unable to load module spec from {py_file}")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _instantiate_tools_class(module_name: str, module_obj: Any) -> Any | None:
+    """Instantiate module.Tools with best-effort dependency injection."""
+    tools_cls = getattr(module_obj, "Tools", None)
+    if tools_cls is None:
+        return None
+
+    # Drop-in OpenWebUI-compatible tools should be zero-arg constructible.
+    return tools_cls()
+
+
+def _build_openwebui_tool_registry() -> tuple[dict[str, Any], list[types.Tool], dict[str, Any]]:
+    """Build OpenWebUI-compatible tool specs and their MCP schema projection."""
+    try:
+        from .tools.openwebui_adapter import build_tool_specs, specs_to_mcp_tools
+    except ImportError:
+        from tools.openwebui_adapter import build_tool_specs, specs_to_mcp_tools
+
+    module_names_env = os.environ.get("OWUI_TOOLS_MODULES", "").strip()
+    modules: list[tuple[str, Any]] = []
+
+    if module_names_env:
+        for raw_name in [m.strip() for m in module_names_env.split(",") if m.strip()]:
+            try:
+                modules.append((raw_name, importlib.import_module(raw_name)))
+            except Exception as exc:
+                logger.warning("Skipping OWUI module %s: %s", raw_name, exc)
+    else:
+        for py_file in sorted(_tools_dir().glob("*.py")):
+            if py_file.name in {"__init__.py", "openwebui_adapter.py"}:
+                continue
+            if not _is_atomic_tool_filename(py_file):
+                logger.warning(
+                    "Skipping tool file %s: filename must match '*_tool.py' for atomic discovery",
+                    py_file.name,
+                )
+                continue
+            try:
+                mod = _load_module_from_file(py_file)
+                modules.append((py_file.stem, mod))
+            except Exception as exc:
+                logger.warning("Skipping tool file %s: %s", py_file.name, exc)
+
+    merged_specs: dict[str, Any] = {}
+    tools_objects: dict[str, Any] = {}
+
+    for module_name, module_obj in modules:
+        try:
+            tools_obj = _instantiate_tools_class(module_name, module_obj)
+        except Exception as exc:
+            logger.warning("Skipping tools module %s: failed to instantiate Tools (%s)", module_name, exc)
+            continue
+        if tools_obj is None:
+            continue
+
+        tools_objects[module_name] = tools_obj
+        module_specs = build_tool_specs(tools_obj)
+
+        if len(module_specs) != 1:
+            logger.warning(
+                "Skipping tools module %s: expected exactly one public tool method, found %d",
+                module_name,
+                len(module_specs),
+            )
+            tools_objects.pop(module_name, None)
+            continue
+
+        for tool_name, spec in module_specs.items():
+            if tool_name in merged_specs:
+                logger.warning(
+                    "Duplicate tool name '%s' from module %s ignored (already provided by another module)",
+                    tool_name,
+                    module_name,
+                )
+                continue
+            merged_specs[tool_name] = spec
+
+        logger.info("OpenWebUI tools loaded from module: %s (%d tool(s))", module_name, len(module_specs))
+
+    return merged_specs, specs_to_mcp_tools(merged_specs), tools_objects
+
+
+def _get_openwebui_tool_registry() -> tuple[dict[str, Any], list[types.Tool]]:
+    """Lazily initialize and return the OpenWebUI tool registry."""
+    global _OWUI_TOOL_SPECS, _OWUI_MCP_TOOLS, _OWUI_TOOLS_OBJ, _OWUI_TOOLS_FINGERPRINT
+    current_fingerprint = _tools_fingerprint()
+    needs_reload = (
+        _OWUI_TOOL_SPECS is None
+        or _OWUI_MCP_TOOLS is None
+        or _OWUI_TOOLS_OBJ is None
+        or _OWUI_TOOLS_FINGERPRINT != current_fingerprint
+    )
+    if needs_reload:
+        _OWUI_TOOL_SPECS, _OWUI_MCP_TOOLS, _OWUI_TOOLS_OBJ = _build_openwebui_tool_registry()
+        _OWUI_TOOLS_FINGERPRINT = current_fingerprint
+        logger.info("Loaded %d OpenWebUI-compatible tool(s)", len(_OWUI_MCP_TOOLS))
+    return _OWUI_TOOL_SPECS, _OWUI_MCP_TOOLS
+
 @server.list_resources()
 async def handle_list_resources() -> list[types.Resource]:
     """
@@ -43,6 +189,12 @@ async def handle_list_resources() -> list[types.Resource]:
             name="Data Sources Status",
             description="Current status and availability of all astronomical data sources",
             mimeType="text/plain"
+        ),
+        types.Resource(
+            uri="astro://info/tool_valves",
+            name="Tool Valves Schema",
+            description="OpenWebUI-style Valves/UserValves schema and current values for custom UI configuration",
+            mimeType="application/json"
         )
     ]
 
@@ -70,6 +222,39 @@ Astronomical Data Sources Status
 
 No data sources currently configured.
 """
+
+    elif path == "info/tool_valves":
+        _get_openwebui_tool_registry()
+        modules: dict[str, Any] = {}
+        if _OWUI_TOOLS_OBJ is not None:
+            modules = _OWUI_TOOLS_OBJ
+
+        valves_by_module: dict[str, Any] = {}
+        user_valves_by_module: dict[str, Any] = {}
+
+        for module_name, tools_obj in modules.items():
+            valves = getattr(tools_obj, "valves", None)
+            user_valves = getattr(tools_obj, "user_valves", None)
+
+            if valves is not None and hasattr(valves, "model_json_schema"):
+                valves_by_module[module_name] = {
+                    "schema": valves.model_json_schema(),
+                    "values": valves.model_dump(),
+                }
+            if user_valves is not None and hasattr(user_valves, "model_json_schema"):
+                user_valves_by_module[module_name] = {
+                    "schema": user_valves.model_json_schema(),
+                    "values": user_valves.model_dump(),
+                }
+
+        return json.dumps(
+            {
+                "modules": list(modules.keys()),
+                "valves": valves_by_module,
+                "user_valves": user_valves_by_module,
+            },
+            indent=2,
+        )
     
     else:
         raise ValueError(f"Unknown resource: {path}")
@@ -77,195 +262,9 @@ No data sources currently configured.
 
 @server.list_tools()
 async def handle_list_tools() -> list[types.Tool]:
-    """List all available astronomical data access tools."""
-    return [ 
-        types.Tool(
-            name="get_latlong",
-            description="Geocode a city or place name to latitude, longitude, and timezone using the free Open-Meteo geocoding API. Returns up to 5 matching results ranked by relevance. No API key required.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "location": {
-                        "type": "string",
-                        "description": "City or place name to look up, e.g. 'Winnipeg, Manitoba' or 'Paris' or 'Tokyo, Japan'"
-                    },
-                    "count": {
-                        "type": "integer",
-                        "description": "Maximum number of results to return (default: 1, max: 5)",
-                        "default": 1
-                    }
-                },
-                "required": ["location"]
-            }
-        ),
-        types.Tool(
-            name="get_current_time",
-            description="Get the current local time and date for any city or place. Geocodes the city name via Open-Meteo to determine its timezone, then returns the current time. No API key required.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "location": {
-                        "type": "string",
-                        "description": "City or place name, e.g. 'Winnipeg, Manitoba' or 'Tokyo, Japan' or 'London'"
-                    }
-                },
-                "required": ["location"]
-            }
-        ),
-        types.Tool(
-            name="simbad_search",
-            description="Search the SIMBAD astronomical database for stars, nebulae, galaxies, clusters, and other celestial objects. Supports natural-language queries such as 'List the 10 brightest stars in the sky', 'Emission nebulae in Orion', or 'Globular clusters in Sagittarius'. Results are formatted for non-scientists with common names where available. If no limit is specified, returns up to 10 results.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Natural-language search query, e.g. 'List the 10 brightest stars', 'Emission nebulae in Orion', 'Globular clusters in Sagittarius'"
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of results to return (default: 10, max: 100). Overridden if a number is mentioned in the query.",
-                        "default": 10
-                    }
-                },
-                "required": ["query"]
-            }
-        ),
-        types.Tool(
-            name="get_weather",
-            description="Get current weather conditions for any location using the free Open-Meteo API. Returns temperature, wind speed, humidity, precipitation, pressure, and a human-readable weather description. No API key required.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "latitude": {"type": "number", "description": "Latitude of the location in decimal degrees (-90 to 90)"},
-                    "longitude": {"type": "number", "description": "Longitude of the location in decimal degrees (-180 to 180)"},
-                    "location_name": {"type": "string", "description": "Optional display name for the location (e.g. 'Paris, France')"},
-                    "temperature_unit": {"type": "string", "enum": ["celsius", "fahrenheit"], "default": "celsius"},
-                    "wind_speed_unit": {"type": "string", "enum": ["kmh", "mph", "ms", "kn"], "default": "kmh"}
-                },
-                "required": ["latitude", "longitude"]
-            }
-        ),
-        types.Tool(
-            name="generate_map",
-            description=(
-                "Generate an all-sky zenith star map (sky chart) for a specific location and time. "
-                "Shows stars visible from that location at that time with constellation lines and labels. "
-                "Returns a link to a PNG image. "
-                "Use this when the user asks to see a star chart, sky map, what the night sky looks like, "
-                "or wants a visual representation of the stars visible from a given place and time. "
-                "Do NOT use this when the user asks about a specific constellation — use generate_constellation_map instead."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "lat": {"type": "number", "description": "Observer latitude in decimal degrees (-90 to 90)"},
-                    "lon": {"type": "number", "description": "Observer longitude in decimal degrees (-180 to 180)"},
-                    "location_name": {"type": "string", "description": "Display name for the location (e.g. 'Winnipeg, Manitoba')", "default": "Unknown location"},
-                    "datetime_str": {"type": "string", "description": "ISO 8601 datetime string (e.g. '2026-04-19T22:00:00'), or 'now' for the current time", "default": "now"},
-                    "timezone": {"type": "string", "description": "IANA timezone name (e.g. 'America/Winnipeg', 'America/New_York', 'UTC'). Used when datetime_str is 'now' or lacks timezone info.", "default": "UTC"}
-                },
-                "required": ["lat", "lon"]
-            }
-        ),
-        types.Tool(
-            name="generate_constellation_map",
-            description=(
-                "Generate a detailed star chart centred on a specific constellation, showing its stars, "
-                "deep-sky objects, and Milky Way within the constellation boundaries. "
-                "Returns a link to a PNG image. "
-                "Use this whenever the user mentions a specific constellation by name and wants to see it, "
-                "e.g. 'show me Orion', 'map of Scorpius', 'what does Cassiopeia look like'."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "constellation": {
-                        "type": "string",
-                        "description": "Constellation name (full name such as 'Orion', 'Ursa Major', or IAU abbreviation such as 'ORI', 'UMA')"
-                    }
-                },
-                "required": ["constellation"]
-            }
-        ),
-        types.Tool(
-            name="generate_aavso_map",
-            description=(
-                "Generate an AAVSO Variable Star Plotter (VSP) finder chart for a variable star. "
-                "Fetches a PNG chart from the AAVSO VSP API showing the star field with "
-                "comparison star magnitudes. Returns a link to the chart image. "
-                "Use this when the user asks about a variable star chart, finder chart, "
-                "or wants to observe a variable star such as 'SS Cyg', 'Mira', 'RR Lyr', "
-                "'Delta Cephei', or any other variable star."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "star": {
-                        "type": "string",
-                        "description": "Name of the variable star, e.g. 'SS Cyg', 'Mira', 'RR Lyr'. Provide this OR ra+dec."
-                    },
-                    "ra": {
-                        "type": "number",
-                        "description": "Right Ascension in decimal degrees (0–360). Use with dec when star name is not known."
-                    },
-                    "dec": {
-                        "type": "number",
-                        "description": "Declination in decimal degrees (−90 to +90). Use with ra when star name is not known."
-                    },
-                    "fov": {
-                        "type": "number",
-                        "description": "Field of view in arcminutes (default 60).",
-                        "default": 60
-                    },
-                    "maglimit": {
-                        "type": "number",
-                        "description": "Faint magnitude limit for comparison stars on the chart (default 14.5).",
-                        "default": 14.5
-                    }
-                },
-                "required": []
-            }
-        ),
-        types.Tool(
-            name="variable_comparison_stars",
-            description=(
-                "Retrieve a table of comparison stars with photometric magnitudes for a variable star "
-                "from the AAVSO Variable Star Plotter (VSP) database. "
-                "Returns AUID, coordinates, chart label, and magnitudes in V, B, Rc, Ic, and near-IR bands. "
-                "Use this when the user asks for comparison stars, magnitude reference stars, "
-                "photometry data, or how to measure the brightness of a variable star."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "star": {
-                        "type": "string",
-                        "description": "Name of the variable star, e.g. 'SS Cyg', 'Mira', 'RR Lyr'. Provide this OR ra+dec."
-                    },
-                    "ra": {
-                        "type": "number",
-                        "description": "Right Ascension in decimal degrees (0\u2013360). Use with dec when star name is not known."
-                    },
-                    "dec": {
-                        "type": "number",
-                        "description": "Declination in decimal degrees (\u221290 to +90). Use with ra when star name is not known."
-                    },
-                    "fov": {
-                        "type": "number",
-                        "description": "Field of view in arcminutes (default 60).",
-                        "default": 60
-                    },
-                    "maglimit": {
-                        "type": "number",
-                        "description": "Faintest comparison star magnitude to include (default 14.5).",
-                        "default": 14.5
-                    }
-                },
-                "required": []
-            }
-        ),
-    ]
+    """List tools by introspecting OpenWebUI-compatible Tools methods."""
+    _, mcp_tools = _get_openwebui_tool_registry()
+    return mcp_tools
 
 
 @server.call_tool()
@@ -278,61 +277,19 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
     """
     
     try:
-        if name == "simbad_search":
-            try:
-                from .data_sources.simbad_search import simbad_search
-            except ImportError:
-                from data_sources.simbad_search import simbad_search
-            result = await simbad_search(**arguments)
-            return [types.TextContent(type="text", text=result)]
+        try:
+            from .tools.openwebui_adapter import invoke_spec
+        except ImportError:
+            from tools.openwebui_adapter import invoke_spec
 
-        elif name == "get_weather":
-            result = await _fetch_open_meteo_weather(**arguments)
-            return [types.TextContent(type="text", text=result)]
-
-        elif name == "get_latlong":
-            result = await _fetch_open_meteo_geocode(**arguments)
-            return [types.TextContent(type="text", text=result)]
-
-        elif name == "get_current_time":
-            result = await _get_current_time(**arguments)
-            return [types.TextContent(type="text", text=result)]
-
-        elif name == "generate_map":
-            try:
-                from .data_sources.generate_map import generate_map
-            except ImportError:
-                from data_sources.generate_map import generate_map
-            result = await generate_map(**arguments)
-            return [types.TextContent(type="text", text=result)]
-
-        elif name == "generate_constellation_map":
-            try:
-                from .data_sources.generate_constellation_map import generate_constellation_map
-            except ImportError:
-                from data_sources.generate_constellation_map import generate_constellation_map
-            result = await generate_constellation_map(**arguments)
-            return [types.TextContent(type="text", text=result)]
-
-        elif name == "generate_aavso_map":
-            try:
-                from .data_sources.generate_aavso_map import generate_aavso_map
-            except ImportError:
-                from data_sources.generate_aavso_map import generate_aavso_map
-            result = await generate_aavso_map(**arguments)
-            return [types.TextContent(type="text", text=result)]
-
-        elif name == "variable_comparison_stars":
-            try:
-                from .data_sources.variable_comparison_stars import variable_comparison_stars
-            except ImportError:
-                from data_sources.variable_comparison_stars import variable_comparison_stars
-            result = await variable_comparison_stars(**arguments)
-            return [types.TextContent(type="text", text=result)]
-
-        else:
+        specs, _ = _get_openwebui_tool_registry()
+        spec = specs.get(name)
+        if spec is None:
             raise ValueError(f"Unknown tool: {name}")
-    
+
+        result = await invoke_spec(spec, arguments or {})
+        return [types.TextContent(type="text", text=result)]
+
     except Exception as e:
         logger.error(f"Error in tool {name}: {str(e)}")
         return [types.TextContent(

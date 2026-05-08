@@ -20,6 +20,8 @@ class Settings(BaseSettings):
         "If additional context has been provided from the local knowledge base, use it to answer. "
         "Only call a tool when the user explicitly requests a live lookup, a chart, the current weather, "
         "or current time — not simply because the topic is astronomical. "
+        "Use simbad_lookup_object for one specific object lookup (coordinates/properties of a named object). "
+        "Use simbad_search only for multi-result list/browse queries. "
         "Answer concisely. "
         "When asked to show or generate a chart or map for any star, object, or constellation use generate_constellation_map. "
         "Only use generate_aavso_map when the user explicitly asks for a variable star finder chart or an AAVSO chart for a known variable star such as Mira, SS Cyg, RR Lyr, Delta Cep, or similar. "

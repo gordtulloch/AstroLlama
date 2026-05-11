@@ -573,8 +573,8 @@ html, body { height: 100%; font-family: system-ui, sans-serif; background: var(-
   white-space: pre-wrap;
   word-break: break-word;
 }
-.msg.user      { background: var(--bg-msg-user); align-self: flex-end; max-width: 82%; }
-.msg.assistant { background: var(--bg-msg-ai); }
+.msg.user      { background: var(--bg-msg-user); align-self: flex-end; max-width: 95%; }
+.msg.assistant { background: var(--bg-msg-ai); max-width: 90%; }
 .msg.error     { background: transparent; border: 1px solid var(--error); color: var(--error); }
 
 .msg-label {

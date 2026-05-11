@@ -2261,6 +2261,18 @@
     messagesEl.scrollTop = messagesEl.scrollHeight;
   }
 
+  function parseSummarizeLink(href) {
+    if (!href || !href.startsWith("astrollama://summarize")) return null;
+    const qIndex = href.indexOf("?");
+    if (qIndex === -1) return null;
+    const query = href.slice(qIndex + 1);
+    const params = new URLSearchParams(query);
+    const title = (params.get("title") || "").trim();
+    const paperId = (params.get("paper_id") || "").trim();
+    if (!title) return null;
+    return { title, paperId };
+  }
+
   // ---- Tool call details block (inside an assistant message) -------
   function ensureToolDetails(msgEl) {
     let details = msgEl.querySelector(".tool-details");
@@ -2286,14 +2298,40 @@
     details.open = false;
   }
 
-  function addToolResult(msgEl, name, result) {
+  async function addToolResult(msgEl, name, result) {
     const details = ensureToolDetails(msgEl);
     const entry = [...details.querySelectorAll(".tool-entry")]
       .reverse()
       .find(e => e.dataset.toolName === name);
+    const resultText = String(result || "").trim();
+
     if (entry) {
       entry.dataset.done = "true";
+      const existing = entry.querySelector(".tool-result");
+      if (existing) existing.remove();
+      if (resultText) {
+        const resultDiv = document.createElement("div");
+        resultDiv.className = "tool-result";
+        resultDiv.innerHTML = await renderHighlighted(resultText);
+        entry.appendChild(resultDiv);
+      }
+      details.open = true;
+      return;
     }
+
+    const div = document.createElement("div");
+    div.className = "tool-entry";
+    div.dataset.toolName = name;
+    div.dataset.done = "true";
+    div.innerHTML = `<div class="tool-name">⚙️ ${escHtml(name)}</div>`;
+    if (resultText) {
+      const resultDiv = document.createElement("div");
+      resultDiv.className = "tool-result";
+      resultDiv.innerHTML = await renderHighlighted(resultText);
+      div.appendChild(resultDiv);
+    }
+    details.appendChild(div);
+    details.open = true;
   }
 
   function addToolDownload(msgEl, name, url, size) {
@@ -2386,7 +2424,8 @@
       console.warn("[Highlight] API call failed:", err);
     }
     // Client-side fallback: use marked.js for full markdown rendering
-    return marked.parse(text);
+    const rendered = marked.parse(text);
+    return rendered.replace(/<a\b(?![^>]*\btarget=)([^>]*)>/gi, '<a$1 target="_blank" rel="noopener noreferrer">');
   }
 
   // ---- Send message ------------------------------------------------
@@ -2493,7 +2532,7 @@
               break;
 
             case "tool_result":
-              addToolResult(aiBubble, event.name, event.result);
+              await addToolResult(aiBubble, event.name, event.result);
               scrollToBottom();
               break;
 
@@ -2607,6 +2646,25 @@
       e.preventDefault();
       sendMessage();
     }
+  });
+
+  messagesEl.addEventListener("click", (e) => {
+    const target = e.target instanceof Element ? e.target.closest("a") : null;
+    if (!target) return;
+
+    const href = target.getAttribute("href") || "";
+    const parsed = parseSummarizeLink(href);
+    if (!parsed) return;
+
+    e.preventDefault();
+    if (state.streaming) return;
+
+    const prompt = parsed.paperId
+      ? `Retrieve and summarize the arXiv paper "${parsed.title}" (arXiv:${parsed.paperId}) using load_paper_html_text.`
+      : `Retrieve and summarize the paper "${parsed.title}" using load_paper_html_text.`;
+    promptInput.value = prompt;
+    promptInput.dispatchEvent(new Event("input", { bubbles: true }));
+    sendMessage();
   });
 
   btnCancel.addEventListener("click", () => {

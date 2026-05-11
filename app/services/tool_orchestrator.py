@@ -235,6 +235,22 @@ def _serialize_tool_result(content: Any) -> str:
     return _content_item_to_str(content)
 
 
+def _prepare_llm_tool_content(tool_name: str, result: str) -> str:
+    """Return tool content plus tool-specific reply-format instructions for the LLM."""
+    if tool_name == "search_papers" and "[" in result and "](" in result:
+        return (
+            "TOOL OUTPUT (use directly):\n"
+            f"{result}\n\n"
+            "RESPONSE FORMAT REQUIREMENT:\n"
+            "- Preserve clickable markdown links from the tool output verbatim.\n"
+            "- Do not replace links with plain text such as 'Read more'.\n"
+            "- If listing papers, keep each title as [Title](URL).\n"
+            "- Keep the [Summarize](astrollama://...) action link for each paper.\n"
+            "- Prefer returning the same linked list from the tool output before any added commentary.\n"
+        )
+    return result
+
+
 def _save_large_result(tool_name: str, result: str) -> tuple[str, str]:
     """
     Write *result* to a file in the downloads directory.
@@ -486,7 +502,7 @@ async def run_chat(
                     if image_url:
                         pending_image_url = image_url
                         yield {"type": "tool_image", "name": name, "url": image_url}
-                    llm_content = result_str
+                    llm_content = _prepare_llm_tool_content(name, result_str)
 
                 tool_msg: dict[str, Any] = {
                     "role": "tool",

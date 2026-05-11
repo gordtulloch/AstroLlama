@@ -12,6 +12,30 @@ logger = logging.getLogger(__name__)
 
 _RETRIES = 3
 _RETRY_BASE = 0.5  # seconds; doubles per attempt
+_CONTROL_TOKEN_STOPS = [
+    "<|im_start|>",
+    "<|im_end|>",
+    "<|assistant|>",
+    "<|user|>",
+]
+
+
+def _sanitize_control_tokens(text: str) -> str:
+    cleaned = text
+    for marker in _CONTROL_TOKEN_STOPS:
+        cleaned = cleaned.replace(marker, "")
+    return cleaned
+
+
+def _truncate_at_control_token(text: str) -> tuple[str, bool]:
+    first_idx = -1
+    for marker in _CONTROL_TOKEN_STOPS:
+        idx = text.find(marker)
+        if idx >= 0 and (first_idx < 0 or idx < first_idx):
+            first_idx = idx
+    if first_idx < 0:
+        return text, False
+    return text[:first_idx], True
 
 
 class LlamaServerUnavailableError(Exception):
@@ -60,6 +84,7 @@ class LLMClient:
             "top_p": top_p,
             "max_tokens": max_tokens,
             "stream": True,
+            "stop": _CONTROL_TOKEN_STOPS,
         }
         if tools:
             payload["tools"] = tools
@@ -91,7 +116,22 @@ class LLMClient:
                         if data_str == "[DONE]":
                             return
                         try:
-                            yield json.loads(data_str)
+                            chunk = json.loads(data_str)
+                            # Guard against template-control token leakage from
+                            # model variants that emit raw chat markers.
+                            choices = chunk.get("choices", [])
+                            stop_after_chunk = False
+                            if choices:
+                                delta = choices[0].get("delta", {})
+                                content = delta.get("content")
+                                if isinstance(content, str) and content:
+                                    safe_content, found_control = _truncate_at_control_token(content)
+                                    delta["content"] = _sanitize_control_tokens(safe_content)
+                                    stop_after_chunk = found_control
+                            yield chunk
+                            if stop_after_chunk:
+                                logger.warning("Control token detected in model stream; truncating response")
+                                return
                         except json.JSONDecodeError:
                             logger.debug("Skipping malformed SSE line: %r", raw_line)
                 return  # successful stream finished

@@ -2,7 +2,7 @@
 param(
     [string]$RepoRoot = $PSScriptRoot,
     [int]$Port = 8081,
-    [string]$ModelFile = "Llama-3.2-1B.Q8_0.gguf",
+    [string]$ModelFile = "Qwen2.5-3B-Instruct-Q8_0.gguf",
     [int]$ContextSize = 8192,
     [int]$NgLayers = 99
 )

@@ -9,14 +9,17 @@ license: MIT
 """
 
 import aiohttp
-from typing import Any, Optional, Callable, Awaitable, Literal, Union, Tuple
+import re
+from typing import Any, Optional, Callable, Awaitable, Literal
 from pydantic import BaseModel, Field
 import logging
-from fastapi.responses import HTMLResponse
 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+_YOUTUBE_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
 
 async def emit_status(
@@ -29,29 +32,6 @@ async def emit_status(
         await event_emitter(
             {"type": "status", "data": {"description": description, "done": done}}
         )
-
-
-async def generate_video_embed(
-    video_id: str,
-) -> HTMLResponse:
-    """Helper to generate HTMLResponse for displaying video player"""
-
-    iframe_html = f"""
-<div style="width:100%;max-width:1200px;margin:0 auto;">
-  <div style="position:relative;width:100%;padding-top:56.25%;height:0;overflow:hidden;border-radius:8px;box-shadow:0 2px 12px rgba(0,0,0,0.2);">
-    <iframe src="https://www.youtube.com/embed/{video_id}"
-            style="position:absolute;top:0;left:0;width:100%;height:100%;border:0;"
-            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; fullscreen"
-            allowfullscreen loading="lazy"></iframe>
-  </div>
-</div>
-""".strip()
-
-    return HTMLResponse(
-        content=iframe_html,
-        media_type="text/html",
-        headers={"content-disposition": "inline"},
-    )
 
 
 class Tools:
@@ -80,7 +60,7 @@ class Tools:
         query: str,
         max_results: Optional[int] = None,
         __event_emitter__: Optional[Callable[[Any], Awaitable[None]]] = None,
-    ) -> Union[str, Tuple[HTMLResponse, str]]:
+    ) -> str:
         """
         Search YouTube for videos matching the query and display embedded player for first result.
 
@@ -132,7 +112,10 @@ class Tools:
                     result = f"**YouTube Search Results for '{query}'**\n\n"
 
                     for i, item in enumerate(search_data["items"], 1):
-                        video_id = item["id"]["videoId"]
+                        video_id = item.get("id", {}).get("videoId")
+                        if not video_id:
+                            # Skip malformed API rows that do not include a video id.
+                            continue
                         snippet = item["snippet"]
                         title = snippet.get("title", "Unknown Title")
                         channel = snippet.get("channelTitle", "Unknown Channel")
@@ -140,9 +123,8 @@ class Tools:
 
                         result += f"**{i}. {title}**\n"
                         result += f"   • Channel: {channel}\n"
-                        result += (
-                            f"   • URL: https://www.youtube.com/watch?v={video_id}\n"
-                        )
+                        watch_url = f"https://www.youtube.com/watch?v={video_id}"
+                        result += f"   • URL: [{watch_url}]({watch_url})\n"
                         if description:
                             result += f"   • Description: {description}...\n"
                         result += "\n"
@@ -152,9 +134,10 @@ class Tools:
                             await emit_status(
                                 __event_emitter__, "Search completed", done=True
                             )
+                            watch_url = f"https://www.youtube.com/watch?v={video_id}"
                             return (
-                                await generate_video_embed(video_id),
-                                f"Search completed. Playing first result: {title}",
+                                f"Search completed. Playing first result: **{title}**. "
+                                f"[Watch on YouTube]({watch_url})"
                             )
 
                     await emit_status(__event_emitter__, "Search completed", done=True)
@@ -171,7 +154,7 @@ class Tools:
         self,
         video_id: str,
         __event_emitter__: Optional[Callable[[Any], Awaitable[None]]] = None,
-    ) -> Union[str, Tuple[HTMLResponse, str]]:
+    ) -> str:
         """
         Play a specific YouTube video by ID in an embedded player.
         This tool requires a valid YouTube video ID. and DOES NOT use the YouTube Data API for searching.
@@ -185,13 +168,17 @@ class Tools:
         await emit_status(__event_emitter__, f"Loading video: {video_id}")
 
         try:           
+            video_id = str(video_id or "").strip()
+            if not _YOUTUBE_VIDEO_ID_RE.match(video_id):
+                return (
+                    "Error: Invalid YouTube video ID format. "
+                    "Please provide the 11-character video ID from a watch URL (for example, dQw4w9WgXcQ)."
+                )
 
             await emit_status(__event_emitter__, "Video loaded", done=True)
 
-            return (
-                await generate_video_embed(video_id),
-                f"Playing video: https://www.youtube.com/watch?v={video_id}",
-            )
+            watch_url = f"https://www.youtube.com/watch?v={video_id}"
+            return f"Playing video. [Watch on YouTube]({watch_url})"
 
         except Exception as e:
             logger.error(f"Error loading video: {str(e)}")

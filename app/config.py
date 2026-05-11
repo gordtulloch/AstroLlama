@@ -9,7 +9,7 @@ class Settings(BaseSettings):
     )
 
     llama_server_url: str = "http://localhost:8081"
-    mcp_server_url: str = "http://localhost:8000/mcp"
+    mcp_server_url: str = "http://localhost:8000/mcp/"
 
     app_host: str = "localhost"
     app_port: int = 8080

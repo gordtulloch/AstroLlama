@@ -85,7 +85,7 @@ class LLMClient:
             "temperature": temperature,
             "top_p": top_p,
             "max_tokens": max_tokens,
-            "stream": True,
+            "stream": use_stream,
             "stop": _CONTROL_TOKEN_STOPS,
         }
         if tools:
@@ -102,6 +102,26 @@ class LLMClient:
         url = f"{self.base_url}/v1/chat/completions"
         for attempt in range(_RETRIES):
             try:
+                if not use_stream:
+                    # Non-streaming path: used when tools are present since
+                    # llama.cpp does not support stream=true with tools.
+                    resp = await self._client.post(url, json=payload)
+                    if resp.status_code >= 400:
+                        logger.error(
+                            "llama-server HTTP %d: %s",
+                            resp.status_code,
+                            resp.text[:1000],
+                        )
+                    resp.raise_for_status()
+                    chunk = resp.json()
+                    # Normalise to streaming-style delta so callers see a
+                    # consistent shape: wrap message as a delta chunk.
+                    choices = chunk.get("choices", [])
+                    if choices and "message" in choices[0] and "delta" not in choices[0]:
+                        choices[0]["delta"] = choices[0]["message"]
+                    yield chunk
+                    return
+
                 async with self._client.stream("POST", url, json=payload) as resp:
                     if resp.status_code >= 400:
                         await resp.aread()

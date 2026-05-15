@@ -11,6 +11,11 @@ from mcp.client.streamable_http import streamablehttp_client
 logger = logging.getLogger(__name__)
 
 
+def _is_session_termination_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return "session terminated" in msg or "session" in msg and "terminated" in msg
+
+
 def _mcp_to_openai_tool(tool: Any) -> dict[str, Any]:
     """Convert an MCP Tool object to the OpenAI function-tool schema."""
     return {
@@ -90,9 +95,51 @@ class MCPClient:
             if not self._available:
                 raise RuntimeError("MCP server is unavailable")
 
-        result = await self._session.call_tool(name, arguments)
+        try:
+            result = await self._session.call_tool(name, arguments)
+        except Exception as exc:
+            if not _is_session_termination_error(exc):
+                raise
+            logger.warning("MCP tool call session terminated; reconnecting and retrying once")
+            await self.reconnect()
+            if not self._available or self._session is None:
+                raise RuntimeError("MCP server is unavailable after reconnect")
+            result = await self._session.call_tool(name, arguments)
         # Return the raw content list; callers decide how to serialize it.
         return result.content
+
+    async def read_resource(self, uri: str) -> str:
+        if not self._available or self._session is None:
+            logger.info("MCP not connected — attempting reconnect before read_resource")
+            await self.reconnect()
+            if not self._available:
+                raise RuntimeError("MCP server is unavailable")
+
+        try:
+            result = await self._session.read_resource(uri)
+        except Exception as exc:
+            if not _is_session_termination_error(exc):
+                raise
+            logger.warning("MCP read_resource session terminated; reconnecting and retrying once")
+            await self.reconnect()
+            if not self._available or self._session is None:
+                raise RuntimeError("MCP server is unavailable after reconnect")
+            result = await self._session.read_resource(uri)
+
+        contents = getattr(result, "contents", None) or []
+        if not contents:
+            return ""
+
+        item = contents[0]
+        text = getattr(item, "text", None)
+        if isinstance(text, str):
+            return text
+
+        data = getattr(item, "data", None)
+        if isinstance(data, str):
+            return data
+
+        return str(item)
 
     # ------------------------------------------------------------------
     # Internal helpers

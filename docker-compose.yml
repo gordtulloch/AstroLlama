@@ -18,7 +18,7 @@ services:
       - "--ctx-size"
       - "${LLAMA_CTX_SIZE:-8192}"
       - "--flash-attn"
-      - "auto"
+      - "--jinja"
       - "-ngl"
       - "${LLAMA_NGL:-99}"
 
@@ -40,6 +40,7 @@ services:
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
+      - ./common:/app/common
       - ./mcp_server:/app/mcp_server
     healthcheck:
       test: ["CMD", "python", "-c", "import socket; s=socket.create_connection(('127.0.0.1',8000), 2); s.close()"]
@@ -71,13 +72,15 @@ services:
       - "${APP_PORT:-8080}:8080"
     environment:
       LLAMA_SERVER_URL: http://llama:8081
-      MCP_SERVER_URL: http://mcp:8000/mcp
+      MCP_SERVER_URL: http://mcp:8000/mcp/
       APP_HOST: 0.0.0.0
       APP_PORT: 8080
     volumes:
       - ./app:/app/app
+      - ./common:/app/common
       - ./static:/app/static
       - ./data:/app/data
+      - ./logs:/app/logs
       - ./logs:/app/logs
       - ./mcp_server:/app/mcp_server
       - ./scripts:/app/scripts

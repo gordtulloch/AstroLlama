@@ -23,6 +23,9 @@ from mcp.server import NotificationOptions, Server
 from mcp.server.models import InitializationOptions
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from pydantic import AnyUrl
+from pydantic import ValidationError
+
+from common.valves_store import ValvesStore
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -35,6 +38,7 @@ _OWUI_TOOL_SPECS = None
 _OWUI_MCP_TOOLS: list[types.Tool] | None = None
 _OWUI_TOOLS_OBJ: dict[str, Any] | None = None
 _OWUI_TOOLS_FINGERPRINT: tuple[tuple[str, int], ...] | None = None
+_VALVES_STORE = ValvesStore()
 
 
 def _tools_dir() -> Path:
@@ -67,6 +71,7 @@ def _tools_fingerprint() -> tuple[tuple[str, int], ...]:
         except OSError:
             mtime_ns = 0
         rows.append((py_file.name, mtime_ns))
+    rows.append(("__tool_valves_db__", _VALVES_STORE.fingerprint()))
     return tuple(rows)
 
 
@@ -89,7 +94,21 @@ def _instantiate_tools_class(module_name: str, module_obj: Any) -> Any | None:
         return None
 
     # Drop-in OpenWebUI-compatible tools should be zero-arg constructible.
-    return tools_cls()
+    tools_obj = tools_cls()
+
+    valves = getattr(tools_obj, "valves", None)
+    if valves is not None and hasattr(valves, "model_dump") and hasattr(valves, "model_validate"):
+        overrides = _VALVES_STORE.get(module_name)
+        if overrides:
+            merged = valves.model_dump()
+            merged.update(overrides)
+            try:
+                tools_obj.valves = valves.__class__.model_validate(merged)
+                logger.info("Applied persisted valves for %s (%d field(s))", module_name, len(overrides))
+            except ValidationError as exc:
+                logger.warning("Ignoring invalid valves override for %s: %s", module_name, exc)
+
+    return tools_obj
 
 
 def _build_openwebui_tool_registry() -> tuple[dict[str, Any], list[types.Tool], dict[str, Any]]:
@@ -503,48 +522,67 @@ async def _run_http(port: int):
 
     async def mcp_app(scope, receive, send):
         # Plain GET without SSE accept header: return usage info instead of 400
-        if scope["type"] == "http" and scope["method"] == "GET":
-            accept = dict(scope.get("headers", [])).get(b"accept", b"").decode()
-            if "text/event-stream" not in accept:
-                from starlette.responses import JSONResponse
-                response = JSONResponse({
-                    "endpoint": "/mcp",
-                    "transport": "streamable-http",
-                    "usage": {
-                        "POST /mcp": "Send MCP JSON-RPC messages",
-                        "GET /mcp": "Open SSE stream (requires Accept: text/event-stream)",
-                        "DELETE /mcp": "Terminate session (requires mcp-session-id header)",
-                    },
-                    "note": "Connect using an MCP client configured for streamable-http transport.",
-                })
-                await response(scope, receive, send)
-                return
-        await session_manager.handle_request(scope, receive, send)
+        try:
+            if scope["type"] == "http" and scope["method"] == "GET":
+                accept = dict(scope.get("headers", [])).get(b"accept", b"").decode()
+                if "text/event-stream" not in accept:
+                    from starlette.responses import JSONResponse
+                    response = JSONResponse({
+                        "endpoint": "/mcp (or /mcp/)",
+                        "transport": "streamable-http",
+                        "usage": {
+                            "POST /mcp": "Send MCP JSON-RPC messages",
+                            "POST /mcp/": "Send MCP JSON-RPC messages",
+                            "GET /mcp": "Open SSE stream (requires Accept: text/event-stream)",
+                            "GET /mcp/": "Open SSE stream (requires Accept: text/event-stream)",
+                            "DELETE /mcp": "Terminate session (requires mcp-session-id header)",
+                            "DELETE /mcp/": "Terminate session (requires mcp-session-id header)",
+                        },
+                        "note": "Connect using an MCP client configured for streamable-http transport.",
+                    })
+                    await response(scope, receive, send)
+                    return
+            await session_manager.handle_request(scope, receive, send)
+        except Exception as exc:
+            logger.exception("Unhandled MCP request error: %s", exc)
+            from starlette.responses import JSONResponse
+
+            response = JSONResponse(
+                {
+                    "error": "mcp_request_failed",
+                    "message": str(exc),
+                },
+                status_code=500,
+            )
+            await response(scope, receive, send)
 
     async def root(request):
         return JSONResponse({
             "server": "astrollama-mcp",
             "version": "0.1.0",
-            "mcp_endpoint": f"http://{request.headers.get('host', f'localhost:{port}')}/mcp",
+            "mcp_endpoint": f"http://{request.headers.get('host', f'localhost:{port}')}/mcp/",
             "transport": "streamable-http",
         })
 
     starlette_app = Starlette(
         routes=[
             Route("/", endpoint=root),
+            # Keep a single mount; clients should use the canonical /mcp/ URL.
             Mount("/mcp", app=mcp_app),
         ],
     )
 
+    bind_host = os.environ.get("MCP_BIND_HOST", "0.0.0.0")
+
     config = uvicorn.Config(
         app=starlette_app,
-        host="localhost",
+        host=bind_host,
         port=port,
         log_level="info",
     )
     uv_server = uvicorn.Server(config)
 
-    logger.info(f"Starting HTTP MCP server on http://localhost:{port}/mcp")
+    logger.info(f"Starting HTTP MCP server on http://{bind_host}:{port}/mcp")
 
     async with session_manager.run():
         await uv_server.serve()

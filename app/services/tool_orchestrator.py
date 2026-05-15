@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import uuid
+from difflib import SequenceMatcher
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -26,17 +27,164 @@ _LLM_PREVIEW_LEN = 500  # chars of preview sent to the LLM
 
 _MAX_TOOL_ITERATIONS = 10
 
+_ASR_DISAMBIGUATION_HINT = (
+    "\n\nVOICE TRANSCRIPTION DISAMBIGUATION POLICY:\n"
+    "- Users may be speaking via browser speech recognition; occasional mistranscriptions are expected.\n"
+    "- Use recent conversation context to infer likely intended astronomy terms when wording appears phonetically close but semantically odd.\n"
+    "- Example: if prior context mentions Cepheid variables and the user asks about 'seafood variables', interpret this as 'Cepheid variables'.\n"
+    "- Apply this only when confidence is high from context and phonetic similarity; otherwise ask a brief clarification question.\n"
+    "- If you corrected a likely transcription error, proceed with the corrected term and briefly note the interpreted term in one short phrase.\n"
+)
+
 # Matches Mistral's [TOOL_CALLS] token followed by a JSON array
 _MISTRAL_TOOL_RE = re.compile(r"\[TOOL_CALLS\]\s*(\[.*?\])", re.DOTALL)
 
 # Matches an image URL produced by the generate_map tool
 _IMAGE_URL_RE = re.compile(r"/api/files/[^\s]+\.png")
+_CHAT_CONTROL_RE = re.compile(r"<\|im_start\|>|<\|im_end\|>|<\|assistant\|>|<\|user\|>")
+
+_ASR_ALIAS_MAP: dict[str, str] = {
+    "delta cpi": "Delta Cephei",
+    "delta c p i": "Delta Cephei",
+    "seafood variables": "Cepheid variables",
+}
+
+_TOOL_NAME_QUERY_KEYS = {
+    "object",
+    "object_name",
+    "name",
+    "query",
+    "target",
+    "star",
+    "designation",
+}
+
+
+def _sanitize_prompt_text(text: str) -> str:
+    cleaned = _CHAT_CONTROL_RE.sub(" ", str(text or ""))
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
 
 
 def _extract_image_url(result: str) -> str | None:
     """Return the first /api/files/*.png URL found in *result*, or None."""
     m = _IMAGE_URL_RE.search(result)
     return m.group(0) if m else None
+
+
+def _normalize_phrase(text: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9\s]", " ", text.lower())).strip()
+
+
+def _collect_context_terms(history: list[dict[str, Any]], limit: int = 10) -> list[str]:
+    """Collect likely astronomy terms from recent turns for ASR disambiguation."""
+    terms: list[str] = []
+    seen: set[str] = set()
+
+    for msg in history[-limit:]:
+        content = str(msg.get("content") or "")
+        if not content:
+            continue
+
+        # Prefer named entities / object-like phrases from recent context.
+        for m in re.finditer(r"\b(?:[A-Z][A-Za-z0-9-]*)(?:\s+[A-Z][A-Za-z0-9-]*){0,2}\b", content):
+            phrase = m.group(0).strip()
+            norm = _normalize_phrase(phrase)
+            if not norm or len(norm) < 4:
+                continue
+            if norm in seen:
+                continue
+            seen.add(norm)
+            terms.append(phrase)
+
+    # Always include explicit known high-value aliases.
+    for canonical in _ASR_ALIAS_MAP.values():
+        norm = _normalize_phrase(canonical)
+        if norm and norm not in seen:
+            seen.add(norm)
+            terms.append(canonical)
+
+    return terms
+
+
+def _disambiguate_string_arg(text: str, context_terms: list[str]) -> tuple[str, str | None]:
+    raw = str(text or "")
+    if not raw.strip():
+        return raw, None
+
+    normalized_raw = _normalize_phrase(raw)
+
+    # 1) Safe explicit substitutions for known repeated ASR failures.
+    for alias, canonical in _ASR_ALIAS_MAP.items():
+        if alias in normalized_raw:
+            pattern = re.compile(rf"\b{re.escape(alias)}\b", re.IGNORECASE)
+            replaced = pattern.sub(canonical, raw)
+            if replaced != raw:
+                return replaced, canonical
+            return canonical, canonical
+
+    # 2) Fuzzy whole-phrase correction for short object-like queries.
+    word_count = len(normalized_raw.split())
+    if word_count == 0 or word_count > 5 or len(normalized_raw) > 48:
+        return raw, None
+
+    best_term = ""
+    best_score = 0.0
+    first_raw = normalized_raw.split()[0]
+    for term in context_terms:
+        norm_term = _normalize_phrase(term)
+        if not norm_term:
+            continue
+        score = SequenceMatcher(None, normalized_raw, norm_term).ratio()
+        if score > best_score:
+            best_score = score
+            best_term = term
+
+    if not best_term:
+        return raw, None
+
+    norm_best = _normalize_phrase(best_term)
+    first_best = norm_best.split()[0] if norm_best else ""
+    # Accept strong matches, or moderate matches when first token aligns
+    # (e.g., "delta cpi" -> "Delta Cephei").
+    if best_score >= 0.88 or (best_score >= 0.73 and first_raw == first_best):
+        return best_term, best_term
+
+    return raw, None
+
+
+def _disambiguate_tool_args(
+    name: str,
+    args: dict[str, Any],
+    history: list[dict[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    context_terms = _collect_context_terms(history)
+    if not context_terms:
+        return args, []
+
+    changes: list[dict[str, str]] = []
+
+    def walk(value: Any, key_hint: str = "") -> Any:
+        if isinstance(value, dict):
+            return {k: walk(v, k) for k, v in value.items()}
+        if isinstance(value, list):
+            return [walk(v, key_hint) for v in value]
+        if not isinstance(value, str):
+            return value
+
+        key_norm = key_hint.lower().strip()
+        is_query_like = key_norm in _TOOL_NAME_QUERY_KEYS or key_norm.endswith("name") or key_norm.endswith("query")
+
+        # Disambiguate aggressively on query-like fields; conservatively otherwise.
+        new_val, interpreted = _disambiguate_string_arg(value, context_terms)
+        if interpreted and (is_query_like or new_val != value):
+            if new_val != value:
+                changes.append({"field": key_hint or "(value)", "from": value, "to": new_val})
+            return new_val
+        return value
+
+    updated = walk(args)
+    return updated, changes
 
 
 def _parse_mistral_tool_calls(content: str) -> tuple[list[dict[str, Any]], str]:
@@ -175,13 +323,22 @@ async def run_chat(
                 "content": llm_messages[0]["content"] + simbad_hint,
             }
 
+    # Help the model recover likely speech-to-text mistakes using nearby context.
+    if llm_messages and llm_messages[0].get("role") == "system":
+        llm_messages[0] = {
+            **llm_messages[0],
+            "content": llm_messages[0]["content"] + _ASR_DISAMBIGUATION_HINT,
+        }
+
     if retriever and retriever.available and retriever.document_count > 0:
         user_msgs = [m for m in history if m.get("role") == "user"]
         if user_msgs:
             query_text = user_msgs[-1].get("content", "")
             chunks = retriever.query(query_text)
             if chunks:
-                context_text = "\n\n---\n\n".join(chunks)
+                clean_chunks = [_sanitize_prompt_text(c) for c in chunks]
+                clean_chunks = [c for c in clean_chunks if c]
+                context_text = "\n\n---\n\n".join(clean_chunks)
                 rag_addition = (
                     "\n\nThe following context was retrieved from the local knowledge base. "
                     "Use it to help answer the question.\n\n"
@@ -285,6 +442,14 @@ async def run_chat(
                 args: dict[str, Any] = json.loads(tc["function"]["arguments"] or "{}")
             except json.JSONDecodeError:
                 args = {}
+
+            args, disambiguation_changes = _disambiguate_tool_args(name, args, history)
+            if disambiguation_changes:
+                logger.info(
+                    "Tool args disambiguated for %s: %s",
+                    name,
+                    json.dumps(disambiguation_changes, ensure_ascii=False),
+                )
 
             yield {"type": "tool_start", "name": name, "args": args}
             logger.info("Tool call → %s  args=%s", name, json.dumps(args, ensure_ascii=False)[:200])

@@ -61,8 +61,10 @@
         <div id="input-controls">
           <button id="btn-send" class="btn-primary">Send</button>
           <button id="btn-mic" class="btn-secondary" title="Start voice input" aria-pressed="false">Mic</button>
+          <button id="btn-viz-fullscreen" class="btn-secondary" title="Open full screen visualization" aria-pressed="false">Full Screen Visual</button>
           <button id="btn-tts" class="btn-secondary" title="Toggle read-aloud" aria-pressed="false">Voice Off</button>
           <button id="btn-cancel" class="btn-danger" disabled>Cancel</button>
+          <button id="btn-tools" class="btn-secondary" title="Configure tool valves">Tools &#9881;</button>
           <details id="settings-panel">
             <summary>&#9881; Settings</summary>
             <div class="settings-grid">
@@ -95,6 +97,10 @@
                 <input type="checkbox" id="s-reactive-orb" checked />
                 Mic-reactive orb while speaking
               </label>
+              <label class="full-width">
+                <input type="checkbox" id="s-viz-fullscreen-default" />
+                Open visualization in full screen instead of chat window
+              </label>
             </div>
           </details>
         </div>
@@ -102,8 +108,46 @@
     </main>
   </div>
 
+  <div id="voice-start-gate" aria-hidden="true" class="hidden">
+    <div class="voice-start-card" role="dialog" aria-modal="true" aria-labelledby="voice-start-title">
+      <div class="voice-start-title" id="voice-start-title">Voice Ready Check</div>
+      <p class="voice-start-copy">Start voice once to unlock spoken responses and wake listening.</p>
+      <button id="btn-voice-start" class="btn-primary" type="button">Start Voice</button>
+    </div>
+  </div>
+
+  <div id="tools-modal" aria-hidden="true" class="tools-modal hidden">
+    <div class="tools-modal-card" role="dialog" aria-modal="true" aria-labelledby="tools-modal-title">
+      <div class="tools-modal-head">
+        <div class="tools-modal-title" id="tools-modal-title">Tool Valves</div>
+        <button id="btn-tools-close" class="btn-secondary" type="button" title="Close">Close</button>
+      </div>
+      <div class="tools-modal-body">
+        <label class="tools-select-label">Tool
+          <select id="tools-select"></select>
+        </label>
+        <div id="tools-valves-form" class="tools-valves-form"></div>
+      </div>
+      <div class="tools-modal-foot">
+        <button id="btn-tools-refresh" class="btn-secondary" type="button">Refresh</button>
+        <button id="btn-tools-save" class="btn-primary" type="button">Save Valves</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="viz-fullscreen" aria-hidden="true">
+    <div id="fullscreen-pulse" class="pulse-idle" aria-hidden="true">
+      <div class="pulse-core"></div>
+      <div class="pulse-ring pulse-ring-a"></div>
+      <div class="pulse-ring pulse-ring-b"></div>
+      <div class="pulse-ring pulse-ring-c"></div>
+    </div>
+    <div id="viz-fullscreen-hint">Press Esc to exit full screen</div>
+  </div>
+
   <!-- MSAL is loaded dynamically by app.js with fallback CDN support -->
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-  <script src="app.js?v=20260507c"></script>
+  <script src="js/features/tools/valvesModal.js?v=20260509d"></script>
+  <script src="app.js?v=20260509i"></script>
 </body>
 </html>

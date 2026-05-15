@@ -12,6 +12,30 @@ logger = logging.getLogger(__name__)
 
 _RETRIES = 3
 _RETRY_BASE = 0.5  # seconds; doubles per attempt
+_CONTROL_TOKEN_STOPS = [
+    "<|im_start|>",
+    "<|im_end|>",
+    "<|assistant|>",
+    "<|user|>",
+]
+
+
+def _sanitize_control_tokens(text: str) -> str:
+    cleaned = text
+    for marker in _CONTROL_TOKEN_STOPS:
+        cleaned = cleaned.replace(marker, "")
+    return cleaned
+
+
+def _truncate_at_control_token(text: str) -> tuple[str, bool]:
+    first_idx = -1
+    for marker in _CONTROL_TOKEN_STOPS:
+        idx = text.find(marker)
+        if idx >= 0 and (first_idx < 0 or idx < first_idx):
+            first_idx = idx
+    if first_idx < 0:
+        return text, False
+    return text[:first_idx], True
 
 
 class LlamaServerUnavailableError(Exception):
@@ -54,12 +78,15 @@ class LLMClient:
         Each object is one parsed JSON chunk from the stream.
         Raises LlamaServerUnavailableError after exhausting retries.
         """
+        # llama.cpp does not support streaming when tools are provided
+        use_stream = not bool(tools)
         payload: dict[str, Any] = {
             "messages": messages,
             "temperature": temperature,
             "top_p": top_p,
             "max_tokens": max_tokens,
-            "stream": True,
+            "stream": use_stream,
+            "stop": _CONTROL_TOKEN_STOPS,
         }
         if tools:
             payload["tools"] = tools
@@ -75,26 +102,68 @@ class LLMClient:
         url = f"{self.base_url}/v1/chat/completions"
         for attempt in range(_RETRIES):
             try:
-                async with self._client.stream("POST", url, json=payload) as resp:
+                if use_stream:
+                    async with self._client.stream("POST", url, json=payload) as resp:
+                        if resp.status_code >= 400:
+                            await resp.aread()
+                            logger.error(
+                                "llama-server HTTP %d: %s",
+                                resp.status_code,
+                                resp.text[:1000],
+                            )
+                        resp.raise_for_status()
+                        async for raw_line in resp.aiter_lines():
+                            if not raw_line.startswith("data:"):
+                                continue
+                            data_str = raw_line[5:].strip()
+                            if data_str == "[DONE]":
+                                return
+                            try:
+                                chunk = json.loads(data_str)
+                                choices = chunk.get("choices", [])
+                                stop_after_chunk = False
+                                if choices:
+                                    delta = choices[0].get("delta", {})
+                                    content = delta.get("content")
+                                    if isinstance(content, str) and content:
+                                        safe_content, found_control = _truncate_at_control_token(content)
+                                        delta["content"] = _sanitize_control_tokens(safe_content)
+                                        stop_after_chunk = found_control
+                                yield chunk
+                                if stop_after_chunk:
+                                    logger.warning("Control token detected in model stream; truncating response")
+                                    return
+                            except json.JSONDecodeError:
+                                logger.debug("Skipping malformed SSE line: %r", raw_line)
+                else:
+                    # Non-streaming path (used when tools are present)
+                    resp = await self._client.post(url, json=payload)
                     if resp.status_code >= 400:
-                        await resp.aread()
                         logger.error(
                             "llama-server HTTP %d: %s",
                             resp.status_code,
                             resp.text[:1000],
                         )
                     resp.raise_for_status()
-                    async for raw_line in resp.aiter_lines():
-                        if not raw_line.startswith("data:"):
-                            continue
-                        data_str = raw_line[5:].strip()
-                        if data_str == "[DONE]":
-                            return
-                        try:
-                            yield json.loads(data_str)
-                        except json.JSONDecodeError:
-                            logger.debug("Skipping malformed SSE line: %r", raw_line)
-                return  # successful stream finished
+                    body = resp.json()
+                    choices = body.get("choices", [])
+                    if choices:
+                        msg = choices[0].get("message", {})
+                        content = msg.get("content")
+                        if isinstance(content, str) and content:
+                            safe_content, _ = _truncate_at_control_token(content)
+                            msg["content"] = _sanitize_control_tokens(safe_content)
+                        # Yield as a single streaming-compatible chunk
+                        yield {
+                            "choices": [
+                                {
+                                    "delta": msg,
+                                    "finish_reason": choices[0].get("finish_reason"),
+                                    "tool_calls": msg.get("tool_calls"),
+                                }
+                            ]
+                        }
+                return  # success
 
             except httpx.ConnectError as exc:
                 if attempt == _RETRIES - 1:

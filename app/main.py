@@ -11,8 +11,10 @@ from fastapi.staticfiles import StaticFiles
 from app.config import settings
 from app.routers import chat as chat_router
 from app.routers import conversations as conv_router
+from app.routers import debug as debug_router
 from app.routers import files as files_router
 from app.routers import highlight as highlight_router
+from app.routers import tools as tools_router
 from app.services.auth import EntraTokenValidator
 from app.services.llm import LLMClient
 from app.services.mcp_client import MCPClient
@@ -102,8 +104,10 @@ app = FastAPI(title="LocalAI Chat Client", version="0.1.0", lifespan=lifespan)
 
 app.include_router(chat_router.router, prefix="/api")
 app.include_router(conv_router.router, prefix="/api")
+app.include_router(debug_router.router, prefix="/api")
 app.include_router(files_router.router, prefix="/api")
 app.include_router(highlight_router.router)
+app.include_router(tools_router.router, prefix="/api")
 
 # Serve the static single-page UI
 _static_dir = _REPO_ROOT / "static"

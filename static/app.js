@@ -32,9 +32,14 @@
   const promptInput  = document.getElementById("prompt-input");
   const btnSend      = document.getElementById("btn-send");
   const btnMic       = document.getElementById("btn-mic");
+  const btnVizFullscreen = document.getElementById("btn-viz-fullscreen");
   const btnTts       = document.getElementById("btn-tts");
   const btnVoicePreview = document.getElementById("btn-voice-preview");
   const sidebarPulse = document.getElementById("sidebar-pulse");
+  const fullscreenViz = document.getElementById("viz-fullscreen");
+  const fullscreenPulse = document.getElementById("fullscreen-pulse");
+  const voiceStartGate = document.getElementById("voice-start-gate");
+  const btnVoiceStart = document.getElementById("btn-voice-start");
   const btnCancel    = document.getElementById("btn-cancel");
   const btnNewChat   = document.getElementById("btn-new-chat");
   const btnSaveConv  = document.getElementById("btn-save-conv");
@@ -46,6 +51,10 @@
   const btnLogin     = document.getElementById("btn-login");
   const btnLogout    = document.getElementById("btn-logout");
 
+  const toolValvesController = window.createToolValvesController
+    ? window.createToolValvesController({ apiFetch })
+    : null;
+
   // Settings inputs
   const sTemperature  = document.getElementById("s-temperature");
   const sTopP         = document.getElementById("s-top_p");
@@ -55,6 +64,14 @@
   const sVoiceRate    = document.getElementById("s-voice-rate");
   const sVoicePitch   = document.getElementById("s-voice-pitch");
   const sReactiveOrb  = document.getElementById("s-reactive-orb");
+  const sVizFullscreenDefault = document.getElementById("s-viz-fullscreen-default");
+
+  const ui = {
+    preferFullscreenViz: false,
+    voiceStartRequired: false,
+  };
+
+  const VOICE_START_KEY = "chat_voice_started_once";
 
   // Speech recognition (browser-native, phase 1)
   const SpeechRecognitionCtor = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -62,9 +79,20 @@
     supported: Boolean(SpeechRecognitionCtor),
     recognition: null,
     listening: false,
+    userStopped: false,
+    blockedReason: "",
+    probePending: false,
+    lastProbeResult: "",
+    awaitingWake: true,
     monitoringTts: false,
+    pausedForTts: false,
+    resumeAfterTts: false,
     baseText: "",
     interimText: "",
+    wakeUser: "",
+    keepArmed: false,
+    lastWakeGreeting: "",
+    wakeGreetingUntil: 0,
   };
 
   const tts = {
@@ -78,6 +106,9 @@
     pendingUtterances: 0,
     boundaryPulseTimer: null,
     streamBuffer: "",
+    gestureUnlocked: false,
+    pendingWakeGreeting: "",
+    unlockListenersInstalled: false,
   };
 
   const audioMonitor = {
@@ -99,7 +130,13 @@
       if (saved.top_p        !== undefined) sTopP.value         = saved.top_p;
       if (saved.max_tokens   !== undefined) sMaxTokens.value    = saved.max_tokens;
       if (saved.system_prompt !== undefined) sSystemPrompt.value = saved.system_prompt;
+      if (typeof saved.open_viz_fullscreen === "boolean") {
+        ui.preferFullscreenViz = saved.open_viz_fullscreen;
+      }
     } catch (_) {}
+    if (sVizFullscreenDefault) {
+      sVizFullscreenDefault.checked = ui.preferFullscreenViz;
+    }
   }
 
   function saveSettings() {
@@ -108,6 +145,7 @@
       top_p:         parseFloat(sTopP.value),
       max_tokens:    parseInt(sMaxTokens.value, 10),
       system_prompt: sSystemPrompt.value,
+      open_viz_fullscreen: ui.preferFullscreenViz,
     }));
   }
 
@@ -116,32 +154,145 @@
   );
 
   function setPulseIntensity(value) {
-    if (!sidebarPulse) return;
+    if (!sidebarPulse && !fullscreenPulse) return;
     const clamped = Math.max(0, Math.min(1, Number(value) || 0));
-    sidebarPulse.style.setProperty("--pulse-intensity", clamped.toFixed(3));
+    [sidebarPulse, fullscreenPulse].forEach((pulseEl) => {
+      if (!pulseEl) return;
+      pulseEl.style.setProperty("--pulse-intensity", clamped.toFixed(3));
+    });
   }
 
-  function updateSidebarPulse() {
-    if (!sidebarPulse) return;
-    sidebarPulse.classList.remove("pulse-idle", "pulse-listening", "pulse-thinking", "pulse-speaking");
+  function updateVizFullscreenButtonState() {
+    if (!btnVizFullscreen) return;
+    const active = Boolean(fullscreenViz && fullscreenViz.classList.contains("active"));
+    btnVizFullscreen.textContent = active ? "Exit Visual" : "Full Screen Visual";
+    btnVizFullscreen.setAttribute("aria-pressed", active ? "true" : "false");
+    btnVizFullscreen.title = active
+      ? "Exit full screen visualization"
+      : "Open full screen visualization";
+  }
+
+  function hasVoiceStartedOnce() {
+    try {
+      return localStorage.getItem(VOICE_START_KEY) === "true";
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function setVoiceStartedOnce() {
+    try {
+      localStorage.setItem(VOICE_START_KEY, "true");
+    } catch (_) {}
+  }
+
+  function showVoiceStartGate() {
+    if (!voiceStartGate) return;
+    voiceStartGate.classList.remove("hidden");
+    voiceStartGate.setAttribute("aria-hidden", "false");
+    if (btnVoiceStart) {
+      setTimeout(() => {
+        btnVoiceStart.focus();
+      }, 30);
+    }
+  }
+
+  function hideVoiceStartGate() {
+    if (!voiceStartGate) return;
+    voiceStartGate.classList.add("hidden");
+    voiceStartGate.setAttribute("aria-hidden", "true");
+  }
+
+  function completeVoiceStart(source = "voice_start") {
+    markTtsGestureUnlocked(source);
+    tts.enabled = true;
+    localStorage.setItem("chat_tts_enabled", "true");
+    updateTtsButtonState();
+    setVoiceStartedOnce();
+    ui.voiceStartRequired = false;
+    hideVoiceStartGate();
+
+    speech.userStopped = false;
+    speech.interimText = "";
+    speech.baseText = "";
+    startSpeechRecognition();
+    updateSidebarPulse();
+    logSpeechDebug("voice_start_completed", {
+      text: source,
+      final: true,
+    });
+  }
+
+  function updatePulseElementState(pulseEl) {
+    if (!pulseEl) return;
+    pulseEl.classList.remove("pulse-idle", "pulse-listening", "pulse-thinking", "pulse-speaking");
 
     if (state.streaming) {
-      sidebarPulse.classList.add("pulse-thinking");
+      pulseEl.classList.add("pulse-thinking");
       return;
     }
 
     if (tts.speaking) {
-      sidebarPulse.classList.add("pulse-speaking");
+      pulseEl.classList.add("pulse-speaking");
       return;
     }
 
     if (speech.listening || speech.monitoringTts) {
-      sidebarPulse.classList.add("pulse-listening");
+      pulseEl.classList.add("pulse-listening");
       return;
     }
 
-    sidebarPulse.classList.add("pulse-idle");
-    setPulseIntensity(0);
+    pulseEl.classList.add("pulse-idle");
+  }
+
+  async function enterVizFullscreen(options = {}) {
+    const allowOverlayFallback = options.allowOverlayFallback !== false;
+    if (!fullscreenViz) return;
+    fullscreenViz.classList.add("active");
+    fullscreenViz.setAttribute("aria-hidden", "false");
+    updateSidebarPulse();
+    updateVizFullscreenButtonState();
+
+    if (document.fullscreenElement === fullscreenViz) return;
+    if (!fullscreenViz.requestFullscreen) return;
+
+    try {
+      await fullscreenViz.requestFullscreen();
+    } catch (err) {
+      console.warn("[Viz] Unable to enter fullscreen:", err);
+      if (!allowOverlayFallback) {
+        fullscreenViz.classList.remove("active");
+        fullscreenViz.setAttribute("aria-hidden", "true");
+      }
+      updateVizFullscreenButtonState();
+    }
+  }
+
+  async function exitVizFullscreen() {
+    if (!fullscreenViz) return;
+    if (document.fullscreenElement === fullscreenViz && document.exitFullscreen) {
+      try {
+        await document.exitFullscreen();
+      } catch (err) {
+        console.warn("[Viz] Unable to exit fullscreen:", err);
+      }
+    }
+    fullscreenViz.classList.remove("active");
+    setTimeout(() => {
+      if (!fullscreenViz.classList.contains("active")) {
+        fullscreenViz.setAttribute("aria-hidden", "true");
+      }
+    }, 240);
+    updateVizFullscreenButtonState();
+  }
+
+  function updateSidebarPulse() {
+    if (!sidebarPulse && !fullscreenPulse) return;
+    updatePulseElementState(sidebarPulse);
+    updatePulseElementState(fullscreenPulse);
+    if (!state.streaming && !tts.speaking && !speech.listening && !speech.monitoringTts) {
+      setPulseIntensity(0);
+    }
   }
 
   function clearBoundaryPulse() {
@@ -153,15 +304,15 @@
 
   function pulseOnBoundary() {
     if (!tts.speaking || audioMonitor.active) return;
-    const burst = 0.35 + (Math.random() * 0.55);
+    const burst = 0.68 + (Math.random() * 0.32);
     setPulseIntensity(burst);
     clearBoundaryPulse();
     tts.boundaryPulseTimer = setTimeout(() => {
       if (tts.speaking && !audioMonitor.active) {
-        setPulseIntensity(0.12);
+        setPulseIntensity(0.34);
       }
       tts.boundaryPulseTimer = null;
-    }, 110);
+    }, 90);
   }
 
   function stopSpeechIntensityMonitor() {
@@ -196,6 +347,50 @@
       setPulseIntensity(0.12);
     } else {
       setPulseIntensity(0);
+    }
+  }
+
+  function pauseRecognitionForTts() {
+    if (!speech.recognition) return;
+    if (!speech.listening) {
+      speech.pausedForTts = false;
+      speech.resumeAfterTts = false;
+      return;
+    }
+
+    speech.resumeAfterTts = true;
+    speech.pausedForTts = true;
+    speech.userStopped = true;
+    logSpeechDebug("recognition_paused_for_tts", {
+      text: "paused_for_tts",
+      final: true,
+    });
+
+    try {
+      speech.recognition.stop();
+    } catch (_) {}
+    setMicButtonState();
+  }
+
+  function resumeRecognitionAfterTts() {
+    if (!speech.pausedForTts) return;
+
+    const shouldResume = speech.resumeAfterTts;
+    speech.pausedForTts = false;
+    speech.resumeAfterTts = false;
+    if (!shouldResume) return;
+
+    speech.userStopped = false;
+    speech.awaitingWake = !isEntraSignedIn();
+    logSpeechDebug("recognition_resumed_after_tts", {
+      text: "resumed_after_tts",
+      final: true,
+    });
+
+    try {
+      speech.recognition.start();
+    } catch (_) {
+      startSpeechRecognition();
     }
   }
 
@@ -251,8 +446,8 @@
         }
 
         const rms = Math.sqrt(sum / audioMonitor.data.length);
-        const boosted = Math.max(0, Math.min(1, (rms - 0.015) * 9));
-        audioMonitor.smoothed = (audioMonitor.smoothed * 0.74) + (boosted * 0.26);
+        const boosted = Math.max(0, Math.min(1, (rms - 0.01) * 16));
+        audioMonitor.smoothed = (audioMonitor.smoothed * 0.56) + (boosted * 0.44);
         setPulseIntensity(audioMonitor.smoothed);
 
         audioMonitor.rafId = requestAnimationFrame(tick);
@@ -342,6 +537,59 @@
       }
     }
     return best;
+  }
+
+  function getLocalPreferredVoice(excludeVoiceURI = "") {
+    const lang = navigator.language || "en-US";
+    const voices = window.speechSynthesis.getVoices() || [];
+    const localVoices = voices.filter((v) => v.localService && v.voiceURI !== excludeVoiceURI);
+    if (!localVoices.length) return null;
+
+    let best = localVoices[0];
+    let bestScore = scoreVoiceQuality(best, lang);
+    for (const voice of localVoices) {
+      const score = scoreVoiceQuality(voice, lang);
+      if (score > bestScore) {
+        best = voice;
+        bestScore = score;
+      }
+    }
+    return best;
+  }
+
+  function markTtsGestureUnlocked(source = "unknown") {
+    if (!tts.supported) return;
+    if (tts.gestureUnlocked) return;
+    tts.gestureUnlocked = true;
+    logSpeechDebug("tts_gesture_unlocked", {
+      text: source,
+      final: true,
+    });
+
+    if (tts.pendingWakeGreeting) {
+      const queued = tts.pendingWakeGreeting;
+      tts.pendingWakeGreeting = "";
+      setTimeout(() => {
+        speakWakeGreeting(queued, { fromGesture: true });
+      }, 40);
+    }
+  }
+
+  function installTtsGestureUnlockListeners() {
+    if (!tts.supported || tts.unlockListenersInstalled) return;
+    tts.unlockListenersInstalled = true;
+
+    const handler = (event) => {
+      const source = event && event.type ? String(event.type) : "gesture";
+      markTtsGestureUnlocked(source);
+      document.removeEventListener("pointerdown", handler, true);
+      document.removeEventListener("keydown", handler, true);
+      document.removeEventListener("touchstart", handler, true);
+    };
+
+    document.addEventListener("pointerdown", handler, true);
+    document.addEventListener("keydown", handler, true);
+    document.addEventListener("touchstart", handler, true);
   }
 
   function populateVoiceOptions() {
@@ -436,6 +684,7 @@
     stopSpeechIntensityMonitor();
     updateSidebarPulse();
     window.speechSynthesis.cancel();
+    resumeRecognitionAfterTts();
   }
 
   function createSpeechUtterance(text, preferredVoice) {
@@ -447,11 +696,11 @@
     if (preferredVoice) utterance.voice = preferredVoice;
 
     utterance.onstart = () => {
+      pauseRecognitionForTts();
       tts.speaking = true;
       setPulseIntensity(0.12);
-      if (tts.micReactiveOrb) {
-        startSpeechIntensityMonitor();
-      }
+      // Keep microphone off during assistant speech to avoid echo loops.
+      stopSpeechIntensityMonitor();
       updateSidebarPulse();
     };
 
@@ -464,6 +713,7 @@
       if (tts.pendingUtterances === 0) {
         tts.speaking = false;
         stopSpeechIntensityMonitor();
+        resumeRecognitionAfterTts();
         updateSidebarPulse();
       }
     };
@@ -537,6 +787,170 @@
     }
   }
 
+  function speakWakeGreeting(text, options = {}) {
+    if (!tts.supported || !tts.enabled) {
+      logSpeechDebug("wake_tts_skip", {
+        text: !tts.supported ? "tts_not_supported" : "tts_disabled",
+        final: true,
+      });
+      return;
+    }
+    const message = normalizeForSpeech(text);
+    if (!message) {
+      logSpeechDebug("wake_tts_skip", {
+        text: "empty_wake_greeting",
+        final: true,
+      });
+      return;
+    }
+
+    const fromGesture = Boolean(options.fromGesture);
+
+    const synth = window.speechSynthesis;
+    const initialVoice = getLocalPreferredVoice() || getPreferredVoice();
+
+    function queueWakeUtterance(voice, attempt = 1) {
+      const voiceName = voice?.name || "default";
+      const voiceLang = voice?.lang || navigator.language || "en-US";
+
+      // Reserve one slot so pulse state and monitor behavior stay consistent.
+      tts.pendingUtterances = 1;
+      const utterance = createSpeechUtterance(message, voice);
+
+      const prevStart = utterance.onstart;
+      const prevEnd = utterance.onend;
+      const prevError = utterance.onerror;
+
+      utterance.onstart = (ev) => {
+        if (typeof prevStart === "function") prevStart(ev);
+        logSpeechDebug("wake_tts_start", {
+          text: message,
+          final: true,
+          extra: {
+            attempt,
+            voice: voiceName,
+            lang: voiceLang,
+            paused: Boolean(synth?.paused),
+            speaking: Boolean(synth?.speaking),
+            pending: Boolean(synth?.pending),
+          },
+        });
+      };
+
+      utterance.onend = (ev) => {
+        if (typeof prevEnd === "function") prevEnd(ev);
+        // After wake greeting, keep mic armed (ready for prompt) rather than
+        // returning to wake-listening mode. keepArmed prevents recognition.onstart
+        // from resetting awaitingWake back to true if it fires again.
+        speech.keepArmed = true;
+        speech.awaitingWake = false;
+        setMicButtonState();
+        logSpeechDebug("wake_tts_end", {
+          text: message,
+          final: true,
+          extra: { attempt, voice: voiceName, lang: voiceLang },
+        });
+      };
+
+      utterance.onerror = (ev) => {
+        if (typeof prevError === "function") prevError(ev);
+        const code = ev && ev.error ? String(ev.error) : "unknown";
+        logSpeechDebug("wake_tts_error", {
+          text: message,
+          final: true,
+          extra: {
+            attempt,
+            error: code,
+            voice: voiceName,
+            lang: voiceLang,
+          },
+        });
+
+        // Browser policy can reject TTS until user activation occurs.
+        if (code === "not-allowed") {
+          if (!fromGesture) {
+            tts.pendingWakeGreeting = message;
+            logSpeechDebug("wake_tts_waiting_for_gesture", {
+              text: "Wake greeting queued. Click anywhere once to allow voice output.",
+              final: true,
+              extra: {
+                attempt,
+                voice: voiceName,
+                lang: voiceLang,
+              },
+            });
+            return;
+          }
+
+          logSpeechDebug("wake_tts_blocked_after_gesture", {
+            text: "Wake greeting still blocked after user gesture. Browser speech output is restricted.",
+            final: true,
+            extra: {
+              attempt,
+              voice: voiceName,
+              lang: voiceLang,
+            },
+          });
+        }
+      };
+
+      try {
+        synth.speak(utterance);
+        logSpeechDebug("wake_tts_queued", {
+          text: message,
+          final: true,
+          extra: {
+            attempt,
+            voice: voiceName,
+            lang: voiceLang,
+            paused: Boolean(synth?.paused),
+            speaking: Boolean(synth?.speaking),
+            pending: Boolean(synth?.pending),
+          },
+        });
+      } catch (err) {
+        tts.pendingUtterances = 0;
+        tts.speaking = false;
+        stopSpeechIntensityMonitor();
+        updateSidebarPulse();
+        logSpeechDebug("wake_tts_error", {
+          text: message,
+          final: true,
+          extra: {
+            attempt,
+            error: err && err.message ? String(err.message) : "speak_failed",
+            voice: voiceName,
+            lang: voiceLang,
+          },
+        });
+      }
+    }
+
+    try {
+      if (typeof synth.resume === "function") {
+        synth.resume();
+      }
+      synth.cancel();
+      setTimeout(() => {
+        queueWakeUtterance(initialVoice, 1);
+      }, 50);
+    } catch (err) {
+      tts.pendingUtterances = 0;
+      tts.speaking = false;
+      stopSpeechIntensityMonitor();
+      updateSidebarPulse();
+      logSpeechDebug("wake_tts_error", {
+        text: message,
+        final: true,
+        extra: {
+          error: err && err.message ? String(err.message) : "wake_tts_failed",
+          voice: initialVoice?.name || "default",
+          lang: initialVoice?.lang || navigator.language || "en-US",
+        },
+      });
+    }
+  }
+
   function initTextToSpeech() {
     if (!btnTts) return;
 
@@ -553,7 +967,10 @@
       return;
     }
 
+    installTtsGestureUnlockListeners();
+
     btnTts.addEventListener("click", () => {
+      markTtsGestureUnlocked("voice_button_click");
       tts.enabled = !tts.enabled;
       if (!tts.enabled) {
         cancelSpeechOutput();
@@ -606,6 +1023,7 @@
 
     if (btnVoicePreview) {
       btnVoicePreview.addEventListener("click", () => {
+        markTtsGestureUnlocked("voice_preview_click");
         const wasEnabled = tts.enabled;
         tts.enabled = true;
         speakText("Voice preview. This is how assistant replies will sound.");
@@ -633,28 +1051,356 @@
     return left + (needsSpace ? " " : "") + right;
   }
 
+  function trimTranscriptWindow(text, maxWords = 12) {
+    const words = String(text || "").trim().split(/\s+/).filter(Boolean);
+    if (words.length <= maxWords) return words.join(" ");
+    return words.slice(-maxWords).join(" ");
+  }
+
+  function normalizeSpeechText(text) {
+    return String(text || "")
+      .toLowerCase()
+      .replace(/[.,!?;:]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  // Rate-limit speech debug logging to at most 1 request per second
+  let _speechLogLastSent = 0;
+  let _speechLogQueue = null;
+  let _speechLogTimer = null;
+
+  function logSpeechDebug(event, details = {}) {
+    const text = String(details.text || "").slice(0, 4096);
+    if (!text) return;
+
+    const payload = {
+      event,
+      text,
+      final: details.final ?? null,
+      listening: speech.listening,
+      awaiting_wake: speech.awaitingWake,
+      auth_mode: isEntraSignedIn() ? "entra" : "wake",
+      conversation_id: state.conversationId,
+      extra: details.extra || null,
+    };
+
+    // Keep only the latest payload; flush at most once per second
+    _speechLogQueue = payload;
+    if (!_speechLogTimer) {
+      const delay = Math.max(0, 1000 - (Date.now() - _speechLogLastSent));
+      _speechLogTimer = setTimeout(() => {
+        _speechLogTimer = null;
+        if (!_speechLogQueue) return;
+        const toSend = _speechLogQueue;
+        _speechLogQueue = null;
+        _speechLogLastSent = Date.now();
+        apiFetch("/api/debug/speech-log", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(toSend),
+        }).catch((err) => {
+          console.warn("[Speech] Debug log write failed:", err);
+        });
+      }, delay);
+    }
+  }
+
+  async function probeSpeechMicrophone() {
+    if (speech.probePending) return;
+    speech.probePending = true;
+
+    let stream = null;
+    let context = null;
+    try {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        logSpeechDebug("mic_probe_error", {
+          text: "getusermedia_unavailable",
+        });
+        return;
+      }
+
+      const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextCtor) {
+        logSpeechDebug("mic_probe_error", {
+          text: "audio_context_unavailable",
+        });
+        return;
+      }
+
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+        video: false,
+      });
+
+      context = new AudioContextCtor();
+      const source = context.createMediaStreamSource(stream);
+      const analyser = context.createAnalyser();
+      analyser.fftSize = 512;
+      const data = new Uint8Array(analyser.fftSize);
+      source.connect(analyser);
+
+      await new Promise((resolve) => setTimeout(resolve, 220));
+
+      analyser.getByteTimeDomainData(data);
+      let sum = 0;
+      for (let i = 0; i < data.length; i += 1) {
+        const centered = (data[i] - 128) / 128;
+        sum += centered * centered;
+      }
+
+      const rms = Math.sqrt(sum / data.length);
+      const signalDetected = rms > 0.02;
+      speech.lastProbeResult = signalDetected ? `signal:${rms.toFixed(4)}` : `silent:${rms.toFixed(4)}`;
+      logSpeechDebug(signalDetected ? "mic_probe_signal" : "mic_probe_silent", {
+        text: signalDetected ? `rms:${rms.toFixed(4)}` : `silent:${rms.toFixed(4)}`,
+        extra: { rms: Number(rms.toFixed(4)) },
+      });
+    } catch (err) {
+      speech.lastProbeResult = err && err.name ? `error:${String(err.name)}` : "error:mic_probe_failed";
+      logSpeechDebug("mic_probe_error", {
+        text: err && err.name ? String(err.name) : "mic_probe_failed",
+        extra: { message: err && err.message ? String(err.message) : "unknown" },
+      });
+    } finally {
+      if (stream) {
+        for (const track of stream.getTracks()) {
+          track.stop();
+        }
+      }
+      if (context) {
+        context.close().catch(() => {});
+      }
+      speech.probePending = false;
+    }
+  }
+
+  function getWakeUserCandidates() {
+    const set = new Set();
+    const displayName = state.account ? getDisplayName() : "";
+    const username = state.account?.username || "";
+    if (displayName) {
+      set.add(displayName);
+      const firstName = displayName.split(/\s+/)[0];
+      if (firstName) set.add(firstName);
+    }
+    if (username) {
+      const localPart = username.split("@")[0];
+      if (localPart) {
+        set.add(localPart);
+        set.add(localPart.replace(/[._]/g, " "));
+      }
+    }
+    if (speech.wakeUser) set.add(speech.wakeUser);
+    return Array.from(set).map(v => normalizeSpeechText(v)).filter(Boolean);
+  }
+
+  function extractWakePayload(transcript) {
+    const raw = String(transcript || "").trim();
+    if (!raw) return null;
+
+    const wakeLead = /\bhey\s*,?\s*(l+ama|astro\s*-?\s*l+ama)\b/i;
+    const wakeMatch = raw.match(wakeLead);
+    if (!wakeMatch || wakeMatch.index === undefined) return null;
+
+    let tail = raw.slice(wakeMatch.index + wakeMatch[0].length).trim();
+    tail = tail.replace(/^[\s,!.:;-]+/, "");
+    // New wake phrase rule: "Hey Llama" is sufficient.
+    // If additional words are spoken in the same utterance, treat them as payload.
+    if (!tail) {
+      return {
+        user: "",
+        payload: "",
+        full: raw,
+      };
+    }
+
+    // Keep compatibility with naturally spoken "it's <name> ..." variants
+    // by dropping the optional leading contraction before payload parsing.
+    tail = tail.replace(/^it'?s\s+/i, "").trim();
+    if (!tail) {
+      return {
+        user: "",
+        payload: "",
+        full: raw,
+      };
+    }
+
+    const candidates = getWakeUserCandidates();
+    const normalizedTail = normalizeSpeechText(tail);
+
+    for (const candidate of candidates) {
+      if (normalizedTail === candidate || normalizedTail.startsWith(candidate + " ")) {
+        speech.wakeUser = candidate;
+        const candidateWordCount = candidate.split(" ").length;
+        const words = tail.split(/\s+/);
+        const remainder = words.slice(candidateWordCount).join(" ").trim();
+        return {
+          user: tail.split(/\s+/).slice(0, candidateWordCount).join(" ").trim(),
+          payload: remainder,
+          full: raw,
+        };
+      }
+    }
+
+    const fallbackWords = tail.split(/\s+/);
+    const guessedUser = fallbackWords[0] || "";
+    const payload = fallbackWords.slice(1).join(" ").trim();
+    if (!guessedUser) {
+      return {
+        user: "",
+        payload: tail,
+        full: raw,
+      };
+    }
+    // For "Hey Llama <prompt...>", treat the full tail as payload rather than
+    // interpreting the first word as a required username.
+    return {
+      user: "",
+      payload: tail,
+      full: raw,
+    };
+  }
+
+  function shouldStopWakeListening(transcript) {
+    const normalized = normalizeSpeechText(transcript).replace(/ll+ama/g, "llama").replace(/astro\s*-?\s*llama/g, "llama");
+    return normalized.includes("that'll do llama")
+      || normalized.includes("thatll do llama")
+      || normalized.includes("that will do llama");
+  }
+
+  function isEntraSignedIn() {
+    return Boolean(state.authEnabled && state.account);
+  }
+
   function setMicButtonState() {
     if (!btnMic) return;
     const micActive = speech.listening || speech.monitoringTts;
-    const disabled = !speech.supported || state.streaming || speech.monitoringTts;
+    const disabled = !speech.supported || speech.monitoringTts || tts.speaking;
+    const entraDirectMode = isEntraSignedIn();
     btnMic.disabled = disabled;
     btnMic.classList.toggle("listening", micActive);
+    btnMic.classList.toggle("blocked", !micActive && Boolean(speech.blockedReason));
     btnMic.setAttribute("aria-pressed", micActive ? "true" : "false");
-    if (speech.listening) {
-      btnMic.textContent = "Stop Mic";
-      btnMic.title = "Stop voice input";
+    if (tts.speaking && speech.pausedForTts) {
+      btnMic.textContent = "Mic Off";
+      btnMic.title = "Microphone is paused while assistant speech is playing.";
+    } else if (speech.listening && speech.awaitingWake) {
+      btnMic.textContent = "Listening";
+      btnMic.title = "Listening for questions";
+    } else if (speech.listening && entraDirectMode) {
+      btnMic.textContent = "Mic Direct";
+      btnMic.title = "Entra mode: speech is sent directly (say: That'll do Llama to stop)";
+    } else if (speech.listening) {
+      btnMic.textContent = "Mic Armed";
+      btnMic.title = "Wake phrase accepted. Speak your prompt now.";
     } else if (speech.monitoringTts) {
       btnMic.textContent = "Mic Live";
       btnMic.title = "Mic monitor active while speech is playing";
+    } else if (speech.blockedReason === "network") {
+      btnMic.textContent = "Mic Error";
+      btnMic.title = speech.lastProbeResult.startsWith("silent:")
+        ? "Speech recognition failed with a network error and microphone input appears silent. Check the selected input device and browser speech service."
+        : "Speech recognition failed with a network error. Click to retry after checking browser speech/network availability.";
+    } else if (speech.blockedReason === "not-allowed" || speech.blockedReason === "service-not-allowed") {
+      btnMic.textContent = "Mic Blocked";
+      btnMic.title = "Microphone or speech recognition permission was denied. Click to retry after allowing access.";
     } else {
       btnMic.textContent = "Mic";
-      btnMic.title = "Start voice input";
+      btnMic.title = entraDirectMode
+        ? "Start direct voice input (Entra mode)"
+        : "Start wake-phrase voice input";
     }
     updateSidebarPulse();
   }
 
+  function emitWakeGreeting(nameHint = "") {
+    const rawName = String(nameHint || "").trim();
+    const displayName = rawName || (state.account ? getDisplayName() : "");
+    const greeting = displayName
+      ? `Hi ${displayName}, I am AstroLlama. Ask me anything about astronomy.`
+      : "Hi, I am AstroLlama. Ask me anything about astronomy.";
+    speech.lastWakeGreeting = greeting;
+    speech.wakeGreetingUntil = Date.now() + 12_000;
+
+    appendMessage("assistant", greeting).catch((err) => {
+      console.warn("[Speech] Failed to render wake greeting:", err);
+    });
+    state.messages.push({ role: "assistant", content: greeting });
+    if (tts.supported && tts.enabled) {
+      speakWakeGreeting(greeting);
+    }
+    logSpeechDebug("speech_wake_greeting", {
+      text: greeting,
+      final: true,
+      extra: {
+        tts_enabled: tts.enabled,
+        tts_supported: tts.supported,
+        synth_paused: Boolean(window.speechSynthesis && window.speechSynthesis.paused),
+        synth_speaking: Boolean(window.speechSynthesis && window.speechSynthesis.speaking),
+        synth_pending: Boolean(window.speechSynthesis && window.speechSynthesis.pending),
+      },
+    });
+  }
+
+  function looksLikeWakeGreetingEcho(text) {
+    const normalized = normalizeSpeechText(text);
+    if (!normalized) return false;
+
+    if (normalized.includes("call me llama")) return true;
+    if (normalized.startsWith("hi i am") && normalized.includes("llama")) return true;
+
+    const greetingMarkers = [
+      "i am astrollama",
+      "personally",
+      "astrollama",
+      "call me llama",
+      "anything about astronomy",
+    ];
+    const markerMatches = greetingMarkers.filter(m => normalized.includes(m)).length;
+    if (markerMatches >= 1) return true;
+
+    const lastGreeting = normalizeSpeechText(speech.lastWakeGreeting || "");
+    if (!lastGreeting) return false;
+
+    // Treat as echo when substantial overlap with the most recent wake greeting.
+    const words = normalized.split(" ");
+    const overlap = words.filter(w => w.length > 2 && lastGreeting.includes(w)).length;
+    return overlap >= 3;
+  }
+
+  function applyVizFullscreenPreference() {
+    if (ui.preferFullscreenViz) {
+      enterVizFullscreen({ allowOverlayFallback: true });
+    } else if (fullscreenViz && fullscreenViz.classList.contains("active")) {
+      exitVizFullscreen();
+    }
+  }
+
+  function startSpeechRecognition() {
+    if (!speech.recognition || speech.listening) return;
+    speech.userStopped = false;
+    speech.blockedReason = "";
+    speech.awaitingWake = true;
+    try {
+      speech.recognition.start();
+    } catch (err) {
+      console.warn("[Speech] Unable to start speech recognition:", err);
+      setMicButtonState();
+    }
+  }
+
   function stopSpeechRecognition() {
     if (speech.recognition && speech.listening) {
+      speech.userStopped = true;
+      speech.awaitingWake = true;
+      logSpeechDebug("recognition_stop_requested", {
+        text: "stop_requested",
+      });
       speech.recognition.stop();
     }
   }
@@ -673,6 +1419,15 @@
 
     recognition.onstart = () => {
       speech.listening = true;
+      speech.blockedReason = "";
+      // Don't reset to wake-listening if we're intentionally staying armed
+      // after the wake greeting (keepArmed is set by speakWakeGreeting onend).
+      if (!speech.keepArmed) {
+        speech.awaitingWake = !isEntraSignedIn();
+      }
+      logSpeechDebug("recognition_start", {
+        text: "listening",
+      });
       setMicButtonState();
     };
 
@@ -689,46 +1444,236 @@
         }
       }
 
-      if (finalText) {
-        speech.baseText = appendTranscript(speech.baseText, finalText);
+      if (interimText.trim()) {
+        logSpeechDebug("speech_interim", {
+          text: interimText,
+          final: false,
+        });
       }
 
-      speech.interimText = interimText;
-      promptInput.value = (speech.baseText + speech.interimText).trimStart();
+      if (!finalText) return;
+
+      logSpeechDebug("speech_final", {
+        text: finalText,
+        final: true,
+      });
+
+      const combinedText = appendTranscript(speech.baseText, finalText);
+      speech.baseText = trimTranscriptWindow(combinedText);
+
+      if (!speech.awaitingWake && !isEntraSignedIn()) {
+        const armedText = String(finalText || "").trim();
+        speech.baseText = "";
+        if (!armedText || state.streaming) {
+          setMicButtonState();
+          return;
+        }
+
+        if (shouldStopWakeListening(armedText)) {
+          logSpeechDebug("speech_stop_phrase", {
+            text: armedText,
+            final: true,
+          });
+          speech.interimText = "";
+          speech.userStopped = true;
+          stopSpeechRecognition();
+          promptInput.value = "";
+          setMicButtonState();
+          return;
+        }
+
+        if (looksLikeWakeGreetingEcho(armedText)) {
+          logSpeechDebug("speech_echo_ignored", {
+            text: armedText,
+            final: true,
+          });
+          speech.awaitingWake = false;
+          setMicButtonState();
+          return;
+        }
+
+        const repeatedWake = extractWakePayload(armedText);
+        const repeatedWakeOnly = Boolean(
+          repeatedWake && !String(repeatedWake.payload || "").trim()
+        );
+        if (repeatedWakeOnly) {
+          speech.awaitingWake = false;
+          logSpeechDebug("speech_wake_repeated", {
+            text: armedText,
+            final: true,
+          });
+          setMicButtonState();
+          return;
+        }
+
+        speech.keepArmed = true;
+        speech.awaitingWake = false;
+
+        logSpeechDebug("speech_submit_after_wake", {
+          text: armedText,
+          final: true,
+        });
+        promptInput.value = armedText;
+        sendMessage({ fromVoice: true }).catch(err => {
+          console.warn("[Speech] Post-wake voice send failed:", err);
+        });
+        setMicButtonState();
+        return;
+      }
+
+      if (shouldStopWakeListening(speech.baseText)) {
+        logSpeechDebug("speech_stop_phrase", {
+          text: speech.baseText,
+          final: true,
+        });
+        speech.baseText = "";
+        speech.interimText = "";
+        speech.userStopped = true;
+        stopSpeechRecognition();
+        promptInput.value = "";
+        setMicButtonState();
+        return;
+      }
+
+      if (isEntraSignedIn()) {
+        speech.awaitingWake = false;
+        const directText = String(finalText || "").trim();
+        speech.baseText = "";
+        if (!directText || state.streaming) {
+          setMicButtonState();
+          return;
+        }
+
+        logSpeechDebug("speech_submit_direct", {
+          text: directText,
+          final: true,
+        });
+        promptInput.value = directText;
+        sendMessage({ fromVoice: true }).catch(err => {
+          console.warn("[Speech] Entra voice send failed:", err);
+        });
+        setMicButtonState();
+        return;
+      }
+
+      const wake = extractWakePayload(speech.baseText);
+      if (!wake) {
+        logSpeechDebug("speech_wake_miss", {
+          text: speech.baseText,
+          final: true,
+        });
+        speech.keepArmed = false;
+        speech.awaitingWake = true;
+        setMicButtonState();
+        return;
+      }
+
+      speech.baseText = "";
+      const textToSend = String(wake.payload || "").trim();
+      if (!textToSend) {
+        speech.awaitingWake = false;
+        logSpeechDebug("speech_wake_armed", {
+          text: wake.user || "wake_armed",
+          final: true,
+        });
+        emitWakeGreeting(wake.user || "");
+        setMicButtonState();
+        return;
+      }
+      speech.keepArmed = true;
+      speech.awaitingWake = false;
+      if (state.streaming) {
+        setMicButtonState();
+        return;
+      }
+
+      logSpeechDebug("speech_submit_wake", {
+        text: textToSend,
+        final: true,
+        extra: { user: wake.user },
+      });
+      promptInput.value = textToSend;
+      sendMessage({ fromVoice: true }).catch(err => {
+        console.warn("[Speech] Voice-triggered send failed:", err);
+      });
+      setMicButtonState();
     };
 
     recognition.onerror = (event) => {
       console.warn("[Speech] Recognition error:", event.error);
       speech.interimText = "";
+      const errorCode = event.error || "unknown";
+      if (speech.blockedReason !== errorCode) {
+        logSpeechDebug("recognition_error", {
+          text: errorCode,
+          extra: { error: errorCode },
+        });
+      }
+      if (errorCode === "network") {
+        speech.blockedReason = errorCode;
+        speech.userStopped = true;
+        probeSpeechMicrophone().catch(() => {});
+      }
+      if (errorCode === "not-allowed" || errorCode === "service-not-allowed") {
+        speech.blockedReason = errorCode;
+        speech.userStopped = true;
+      }
     };
 
     recognition.onend = () => {
       speech.listening = false;
       speech.interimText = "";
-      promptInput.value = speech.baseText.trim();
+      logSpeechDebug("recognition_end", {
+        text: speech.baseText || "ended",
+        final: true,
+      });
+      speech.baseText = "";
+      // Auto-restart if the user hasn't explicitly stopped (browser ended it on its own).
+      // Don't restart on network errors — back off to avoid flooding connections.
+      const blockedByNetwork = speech.blockedReason === "network";
+      if (!speech.userStopped && !blockedByNetwork) {
+        try {
+          speech.recognition.start();
+          return;
+        } catch (_) {
+          // If restart fails, fall through and reset state
+        }
+      }
+      // If blocked by network error, retry after a delay rather than immediately
+      if (blockedByNetwork) {
+        setTimeout(() => {
+          speech.blockedReason = "";
+          speech.userStopped = false;
+          setMicButtonState();
+        }, 5000);
+        return;
+      }
+      speech.userStopped = false;
       setMicButtonState();
     };
 
     speech.recognition = recognition;
 
     btnMic.addEventListener("click", () => {
-      if (state.streaming) return;
+      if (ui.voiceStartRequired) {
+        completeVoiceStart("mic_button_click");
+        return;
+      }
       if (speech.listening) {
         stopSpeechRecognition();
         return;
       }
 
-      speech.baseText = promptInput.value.trim();
+      speech.userStopped = false;
       speech.interimText = "";
-
-      try {
-        speech.recognition.start();
-      } catch (err) {
-        console.warn("[Speech] Unable to start speech recognition:", err);
-      }
+      speech.baseText = "";
+      startSpeechRecognition();
     });
 
     setMicButtonState();
+    if (!ui.voiceStartRequired) {
+      startSpeechRecognition();
+    }
   }
 
   // ---- Auth + API wrapper ----------------------------------------
@@ -1098,6 +2043,7 @@
     btnLogout.disabled = !signedIn;
     btnSend.disabled = !signedIn || state.streaming;
     promptInput.disabled = !signedIn;
+    setMicButtonState();
   }
 
   async function signIn() {
@@ -1472,11 +2418,12 @@
   }
 
   // ---- Send message ------------------------------------------------
-  async function sendMessage() {
-    stopSpeechRecognition();
-    speech.listening = false;
-    speech.interimText = "";
-    setMicButtonState();
+  async function sendMessage(options = {}) {
+    const fromVoice = Boolean(options.fromVoice);
+    if (fromVoice) {
+      speech.baseText = "";
+      speech.interimText = "";
+    }
     cancelSpeechOutput();
 
     const text = promptInput.value.trim();
@@ -1674,7 +2621,16 @@
   // ---- Event listeners --------------------------------------------
   btnSend.addEventListener("click", sendMessage);
 
+  if (btnVoiceStart) {
+    btnVoiceStart.addEventListener("click", () => {
+      completeVoiceStart("voice_start_button");
+    });
+  }
+
   promptInput.addEventListener("keydown", (e) => {
+    if (ui.voiceStartRequired) {
+      completeVoiceStart("keyboard_input");
+    }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       sendMessage();
@@ -1686,9 +2642,48 @@
   });
 
   document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && toolValvesController && toolValvesController.isOpen()) {
+      toolValvesController.close();
+      return;
+    }
+    if (e.key === "Escape" && fullscreenViz && fullscreenViz.classList.contains("active")) {
+      exitVizFullscreen();
+      return;
+    }
     if (e.key === "Escape" && state.abortController) {
       state.abortController.abort();
     }
+  });
+
+  if (btnVizFullscreen) {
+    btnVizFullscreen.addEventListener("click", () => {
+      const active = Boolean(fullscreenViz && fullscreenViz.classList.contains("active"));
+      if (active) {
+        exitVizFullscreen();
+      } else {
+        enterVizFullscreen();
+      }
+    });
+  }
+
+  if (toolValvesController) {
+    toolValvesController.bind();
+  }
+
+  if (sVizFullscreenDefault) {
+    sVizFullscreenDefault.addEventListener("change", () => {
+      ui.preferFullscreenViz = Boolean(sVizFullscreenDefault.checked);
+      saveSettings();
+      applyVizFullscreenPreference();
+    });
+  }
+
+  document.addEventListener("fullscreenchange", () => {
+    const active = Boolean(document.fullscreenElement && fullscreenViz && document.fullscreenElement === fullscreenViz);
+    if (!fullscreenViz) return;
+    fullscreenViz.classList.toggle("active", active);
+    fullscreenViz.setAttribute("aria-hidden", active ? "false" : "true");
+    updateVizFullscreenButtonState();
   });
 
   btnNewChat.addEventListener("click", newChat);
@@ -1740,8 +2735,15 @@
     
     // Main window initialization
     loadSettings();
-    initSpeechRecognition();
+    ui.voiceStartRequired = Boolean((speech.supported || tts.supported) && !hasVoiceStartedOnce());
+    if (ui.voiceStartRequired) {
+      showVoiceStartGate();
+    } else {
+      hideVoiceStartGate();
+    }
+    applyVizFullscreenPreference();
     initTextToSpeech();
+    initSpeechRecognition();
     await initHighlightStyles();
 
     try {
@@ -1759,8 +2761,16 @@
 
     console.log("[Init] Auth initialized successfully");
     updateAuthUi();
+    updateVizFullscreenButtonState();
     await loadConvList();
     await pollStatus();
+    if (toolValvesController) {
+      try {
+        await toolValvesController.preload(true);
+      } catch (err) {
+        console.warn("[Tools] Valves menu unavailable:", err);
+      }
+    }
     setInterval(pollStatus, 10_000);
   }
 

@@ -1065,11 +1065,6 @@
       .trim();
   }
 
-  // Rate-limit speech debug logging to at most 1 request per second
-  let _speechLogLastSent = 0;
-  let _speechLogQueue = null;
-  let _speechLogTimer = null;
-
   function logSpeechDebug(event, details = {}) {
     const text = String(details.text || "").slice(0, 4096);
     if (!text) return;
@@ -1085,25 +1080,13 @@
       extra: details.extra || null,
     };
 
-    // Keep only the latest payload; flush at most once per second
-    _speechLogQueue = payload;
-    if (!_speechLogTimer) {
-      const delay = Math.max(0, 1000 - (Date.now() - _speechLogLastSent));
-      _speechLogTimer = setTimeout(() => {
-        _speechLogTimer = null;
-        if (!_speechLogQueue) return;
-        const toSend = _speechLogQueue;
-        _speechLogQueue = null;
-        _speechLogLastSent = Date.now();
-        apiFetch("/api/debug/speech-log", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(toSend),
-        }).catch((err) => {
-          console.warn("[Speech] Debug log write failed:", err);
-        });
-      }, delay);
-    }
+    apiFetch("/api/debug/speech-log", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }).catch((err) => {
+      console.warn("[Speech] Debug log write failed:", err);
+    });
   }
 
   async function probeSpeechMicrophone() {
@@ -1628,25 +1611,14 @@
         final: true,
       });
       speech.baseText = "";
-      // Auto-restart if the user hasn't explicitly stopped (browser ended it on its own).
-      // Don't restart on network errors — back off to avoid flooding connections.
-      const blockedByNetwork = speech.blockedReason === "network";
-      if (!speech.userStopped && !blockedByNetwork) {
+      // Auto-restart if the user hasn't explicitly stopped (browser ended it on its own)
+      if (!speech.userStopped) {
         try {
           speech.recognition.start();
           return;
         } catch (_) {
           // If restart fails, fall through and reset state
         }
-      }
-      // If blocked by network error, retry after a delay rather than immediately
-      if (blockedByNetwork) {
-        setTimeout(() => {
-          speech.blockedReason = "";
-          speech.userStopped = false;
-          setMicButtonState();
-        }, 5000);
-        return;
       }
       speech.userStopped = false;
       setMicButtonState();
@@ -2289,6 +2261,18 @@
     messagesEl.scrollTop = messagesEl.scrollHeight;
   }
 
+  function parseSummarizeLink(href) {
+    if (!href || !href.startsWith("astrollama://summarize")) return null;
+    const qIndex = href.indexOf("?");
+    if (qIndex === -1) return null;
+    const query = href.slice(qIndex + 1);
+    const params = new URLSearchParams(query);
+    const title = (params.get("title") || "").trim();
+    const paperId = (params.get("paper_id") || "").trim();
+    if (!title) return null;
+    return { title, paperId };
+  }
+
   // ---- Tool call details block (inside an assistant message) -------
   function ensureToolDetails(msgEl) {
     let details = msgEl.querySelector(".tool-details");
@@ -2314,14 +2298,40 @@
     details.open = false;
   }
 
-  function addToolResult(msgEl, name, result) {
+  async function addToolResult(msgEl, name, result) {
     const details = ensureToolDetails(msgEl);
     const entry = [...details.querySelectorAll(".tool-entry")]
       .reverse()
       .find(e => e.dataset.toolName === name);
+    const resultText = String(result || "").trim();
+
     if (entry) {
       entry.dataset.done = "true";
+      const existing = entry.querySelector(".tool-result");
+      if (existing) existing.remove();
+      if (resultText) {
+        const resultDiv = document.createElement("div");
+        resultDiv.className = "tool-result";
+        resultDiv.innerHTML = await renderHighlighted(resultText);
+        entry.appendChild(resultDiv);
+      }
+      details.open = true;
+      return;
     }
+
+    const div = document.createElement("div");
+    div.className = "tool-entry";
+    div.dataset.toolName = name;
+    div.dataset.done = "true";
+    div.innerHTML = `<div class="tool-name">⚙️ ${escHtml(name)}</div>`;
+    if (resultText) {
+      const resultDiv = document.createElement("div");
+      resultDiv.className = "tool-result";
+      resultDiv.innerHTML = await renderHighlighted(resultText);
+      div.appendChild(resultDiv);
+    }
+    details.appendChild(div);
+    details.open = true;
   }
 
   function addToolDownload(msgEl, name, url, size) {
@@ -2414,7 +2424,8 @@
       console.warn("[Highlight] API call failed:", err);
     }
     // Client-side fallback: use marked.js for full markdown rendering
-    return marked.parse(text);
+    const rendered = marked.parse(text);
+    return rendered.replace(/<a\b(?![^>]*\btarget=)([^>]*)>/gi, '<a$1 target="_blank" rel="noopener noreferrer">');
   }
 
   // ---- Send message ------------------------------------------------
@@ -2521,7 +2532,7 @@
               break;
 
             case "tool_result":
-              addToolResult(aiBubble, event.name, event.result);
+              await addToolResult(aiBubble, event.name, event.result);
               scrollToBottom();
               break;
 
@@ -2635,6 +2646,25 @@
       e.preventDefault();
       sendMessage();
     }
+  });
+
+  messagesEl.addEventListener("click", (e) => {
+    const target = e.target instanceof Element ? e.target.closest("a") : null;
+    if (!target) return;
+
+    const href = target.getAttribute("href") || "";
+    const parsed = parseSummarizeLink(href);
+    if (!parsed) return;
+
+    e.preventDefault();
+    if (state.streaming) return;
+
+    const prompt = parsed.paperId
+      ? `Retrieve and summarize the arXiv paper "${parsed.title}" (arXiv:${parsed.paperId}) using load_paper_html_text.`
+      : `Retrieve and summarize the paper "${parsed.title}" using load_paper_html_text.`;
+    promptInput.value = prompt;
+    promptInput.dispatchEvent(new Event("input", { bubbles: true }));
+    sendMessage();
   });
 
   btnCancel.addEventListener("click", () => {

@@ -38,6 +38,7 @@ _MD_IMAGE_RE = re.compile(
 )
 
 _IMG_EXTS = re.compile(r"\.(?:png|jpg|jpeg|gif|webp)$", re.IGNORECASE)
+_ANCHOR_TAG_RE = re.compile(r"<a\b(?![^>]*\btarget=)([^>]*)>", re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +55,13 @@ def _make_thumbnail_html(url_raw: str) -> str:
     )
 
 
+def _add_anchor_targets(html: str) -> str:
+    return _ANCHOR_TAG_RE.sub(
+        r'<a\1 target="_blank" rel="noopener noreferrer">',
+        html,
+    )
+
+
 def _render_prose(text: str) -> str:
     """Render plain prose with full markdown support (no fenced code — handled separately)."""
     # Convert bare "Image: /api/files/..." lines into thumbnail HTML.
@@ -61,10 +69,11 @@ def _render_prose(text: str) -> str:
     # Convert markdown images pointing at /api/files/ into thumbnail HTML
     # BEFORE markdown() turns them into unconstrained <img> tags.
     text = _MD_IMAGE_RE.sub(lambda m: _make_thumbnail_html(m.group(1)), text)
-    return markdown_lib.markdown(
+    rendered = markdown_lib.markdown(
         text.strip(),
         extensions=["tables", "sane_lists"],
     )
+    return _add_anchor_targets(rendered)
 
 
 def _render(text: str) -> str:

@@ -4,6 +4,10 @@ ai/*
 data/downloads/*
 duckdb-extensions/*
 
+# Sqlite databases
+*.sqlite3
+*.db
+
 # Downloaded datasets (keep .gitkeep for empty directories)
 *.parquet
 *.bsp

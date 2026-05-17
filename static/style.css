@@ -689,6 +689,63 @@ html, body { height: 100%; font-family: system-ui, sans-serif; background: var(-
 .msg-content strong { font-weight: 700; }
 .msg-content em { font-style: italic; }
 
+/* ---- KaTeX fallback styles -------------------------------- */
+/* Keep math readable even if external katex.min.css fails to load. */
+.msg-content .katex {
+  font: normal 1.05em "Times New Roman", serif;
+  line-height: 1.2;
+  white-space: normal;
+}
+
+.msg-content .katex-display {
+  display: block;
+  margin: 0.35em 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.msg-content .katex .katex-mathml {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  border: 0;
+}
+
+/* ---- Local math fallback styles --------------------------- */
+.msg-content .math-fallback {
+  font-family: "Times New Roman", serif;
+  font-size: 1.02em;
+}
+
+.msg-content .math-fallback.display {
+  display: block;
+  margin: 0.35em 0;
+  overflow-x: auto;
+}
+
+.msg-content .mf-frac {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  vertical-align: middle;
+  margin: 0 0.12em;
+}
+
+.msg-content .mf-num {
+  border-bottom: 1px solid currentColor;
+  padding: 0 0.18em 0.05em;
+  line-height: 1.1;
+}
+
+.msg-content .mf-den {
+  padding: 0.03em 0.18em 0;
+  line-height: 1.1;
+}
+
 .rendered-html {
   border: 1px solid var(--border);
   border-radius: var(--radius);

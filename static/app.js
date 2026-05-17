@@ -2382,6 +2382,7 @@
     content.className = "msg-content";
     if (role === "assistant") {
       content.innerHTML = await renderHighlighted(text);
+      renderMath(content);
     } else {
       const p = document.createElement("p");
       p.textContent = text;
@@ -2466,6 +2467,7 @@
         const resultDiv = document.createElement("div");
         resultDiv.className = "tool-result";
         resultDiv.innerHTML = await renderHighlighted(resultText);
+        renderMath(resultDiv);
         entry.appendChild(resultDiv);
       }
       details.open = true;
@@ -2481,6 +2483,7 @@
       const resultDiv = document.createElement("div");
       resultDiv.className = "tool-result";
       resultDiv.innerHTML = await renderHighlighted(resultText);
+      renderMath(resultDiv);
       div.appendChild(resultDiv);
     }
     details.appendChild(div);
@@ -2562,11 +2565,20 @@
    * Falls back to client-side <pre><code> rendering on error.
    */
   async function renderHighlighted(text) {
+    const normalizedText = normalizeLegacyMathDelimiters(text);
+
+    // Server-side markdown can mangle LaTeX-like text (e.g., backslashes/underscores).
+    // For math-heavy responses, prefer client-side markdown so delimiters survive for KaTeX.
+    if (containsLikelyMath(normalizedText)) {
+      const rendered = marked.parse(normalizedText);
+      return rendered.replace(/<a\b(?![^>]*\btarget=)([^>]*)>/gi, '<a$1 target="_blank" rel="noopener noreferrer">');
+    }
+
     try {
       const r = await apiFetch("/api/highlight", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text }),
+        body: JSON.stringify({ text: normalizedText }),
       });
       if (r.ok) {
         const data = await r.json();
@@ -2577,8 +2589,133 @@
       console.warn("[Highlight] API call failed:", err);
     }
     // Client-side fallback: use marked.js for full markdown rendering
-    const rendered = marked.parse(text);
+    const rendered = marked.parse(normalizedText);
     return rendered.replace(/<a\b(?![^>]*\btarget=)([^>]*)>/gi, '<a$1 target="_blank" rel="noopener noreferrer">');
+  }
+
+  /**
+   * Convert legacy equation blocks like `[ \lambda = ... ]` into KaTeX-ready
+   * display delimiters `\[ ... \]` when the bracketed line appears to be math.
+   */
+  function normalizeLegacyMathDelimiters(text) {
+    if (!text) return text;
+
+    const looksLikeMath = (inner) => /[\\^_=]|\\frac|\\text|\\lambda|\\alpha|\\beta|\\gamma|\\times|\\cdot|\\sum|\\int|\d\s*[=+\-*/]|\{[^}]+\}/.test(inner);
+
+    const src = String(text);
+
+    // 0) Unescape legacy inline math wrappers: \$ ... \$ => $ ... $
+    const withUnescapedDollars = src.replace(/\\\$\s*([^$]+?)\s*\\\$/g, (full, inner) => {
+      if (!looksLikeMath(inner)) return full;
+      return `$${inner}$`;
+    });
+
+    // 1) Convert legacy display blocks only when they occupy an entire line:
+    // [ ... ] => $$ ... $$
+    const withBrackets = withUnescapedDollars.replace(/^\[\s*(.+?)\s*\]$/gm, (full, inner) => {
+      if (!looksLikeMath(inner)) return full;
+      return `$$ ${inner} $$`;
+    });
+
+    // 2) Convert double parens: (( ... )) => $ ... $
+    const withDoubleParens = withBrackets.replace(/\(\(\s*([\s\S]*?)\s*\)\)/g, (full, inner) => {
+      if (!looksLikeMath(inner)) return full;
+      return `$${inner}$`;
+    });
+
+    // 3) Convert legacy single-paren LaTeX snippets: (\lambda_{max}) => $\lambda_{max}$
+    // Only convert when there is a LaTeX-style backslash command to avoid prose rewrites.
+    const withSingleParensLatex = withDoubleParens.replace(/\(([^()\n]{1,180})\)/g, (full, inner) => {
+      if (!/\\[a-zA-Z]+/.test(inner)) return full;
+      if (!looksLikeMath(inner)) return full;
+      return `$${inner.trim()}$`;
+    });
+
+    return withSingleParensLatex;
+  }
+
+  function containsLikelyMath(text) {
+    if (!text) return false;
+    return /(\$\$|\$[^$\n]+\$|\\\(|\\\)|\\\[|\\\]|\\frac|\\text|\\lambda|\\alpha|\\beta|\\gamma|\\times|\\cdot|\\sum|\\int)/.test(text);
+  }
+
+  function applyLocalMathFallback(container) {
+    if (!container) return;
+    if (container.dataset.mathFallbackApplied === "1") return;
+    const html = String(container.innerHTML || "");
+    const next = renderMathHtmlFallback(html);
+    if (next !== html) {
+      container.innerHTML = next;
+      container.dataset.mathFallbackApplied = "1";
+    }
+  }
+
+  function renderMathHtmlFallback(html) {
+    if (!html) return html;
+
+    const renderInline = (expr) => `<span class="math-fallback">${latexToBasicHtml(expr)}</span>`;
+    const renderDisplay = (expr) => `<div class="math-fallback display">${latexToBasicHtml(expr)}</div>`;
+
+    let out = String(html);
+    out = out.replace(/\$\$([\s\S]+?)\$\$/g, (_, expr) => renderDisplay(expr));
+    out = out.replace(/\\\[([\s\S]+?)\\\]/g, (_, expr) => renderDisplay(expr));
+    out = out.replace(/\\\(([\s\S]+?)\\\)/g, (_, expr) => renderInline(expr));
+    out = out.replace(/\$([^$\n]+?)\$/g, (_, expr) => renderInline(expr));
+    return out;
+  }
+
+  function latexToBasicHtml(input, depth = 0) {
+    if (depth > 6) return escHtml(String(input || ""));
+    let s = String(input || "").trim();
+
+    const fracRe = /\\frac\s*\{([^{}]+)\}\s*\{([^{}]+)\}/g;
+    s = s.replace(fracRe, (_, num, den) => {
+      const n = latexToBasicHtml(num, depth + 1);
+      const d = latexToBasicHtml(den, depth + 1);
+      return `<span class="mf-frac"><span class="mf-num">${n}</span><span class="mf-den">${d}</span></span>`;
+    });
+
+    s = escHtml(s)
+      .replace(/\\text\{([^}]*)\}/g, "$1")
+      .replace(/\\times/g, "&times;")
+      .replace(/\\cdot/g, "&middot;")
+      .replace(/\\,|\\;/g, " ")
+      .replace(/\\left|\\right/g, "")
+      .replace(/\\lambda/g, "&lambda;")
+      .replace(/\\alpha/g, "&alpha;")
+      .replace(/\\beta/g, "&beta;")
+      .replace(/\\gamma/g, "&gamma;");
+
+    s = s
+      .replace(/\^\{([^{}]+)\}/g, "<sup>$1</sup>")
+      .replace(/_\{([^{}]+)\}/g, "<sub>$1</sub>")
+      .replace(/\^([A-Za-z0-9+\-])/g, "<sup>$1</sup>")
+      .replace(/_([A-Za-z0-9+\-])/g, "<sub>$1</sub>");
+
+    s = s.replace(/[{}]/g, "").replace(/\s{2,}/g, " ");
+    return s;
+  }
+
+  /** Render LaTeX delimiters in a container using MathJax, if available. */
+  function renderMath(container) {
+    if (!container) return;
+    const mj = window.MathJax;
+    if (!mj || typeof mj.typesetPromise !== "function") {
+      const retries = Number(container.dataset.mathRenderRetries || "0");
+      if (retries < 10) {
+        container.dataset.mathRenderRetries = String(retries + 1);
+        setTimeout(() => renderMath(container), 50);
+      } else {
+        applyLocalMathFallback(container);
+      }
+      return;
+    }
+    delete container.dataset.mathRenderRetries;
+
+    mj.typesetPromise([container]).catch((err) => {
+      console.warn("[Math] MathJax render failed:", err);
+      applyLocalMathFallback(container);
+    });
   }
 
   // ---- Send message ------------------------------------------------
@@ -2738,6 +2875,7 @@
                   contentEl.innerHTML = textForRender
                     ? await renderHighlighted(textForRender)
                     : "";
+                  renderMath(contentEl);
                 }
                 // Re-append all tool-image thumbnails so they always appear
                 // after the text content, regardless of SSE event order.

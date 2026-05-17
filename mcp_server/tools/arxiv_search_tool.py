@@ -190,7 +190,10 @@ class Tools:
         return "no html for" in body_text or "html is not available for the source" in body_text
 
     @staticmethod
-    def _truncate_text(lines: list[str], max_chars: int) -> str:
+    def _truncate_text(lines: list[str], max_chars: Optional[int]) -> str:
+        if max_chars is None or max_chars <= 0:
+            return "\n".join(lines).strip()
+
         chunks: list[str] = []
         total = 0
         for line in lines:
@@ -201,7 +204,7 @@ class Tools:
             total += addition
         return "\n".join(chunks).strip()
 
-    def _extract_html_text(self, html_content: str, max_chars: int) -> str:
+    def _extract_html_text(self, html_content: str, max_chars: Optional[int]) -> str:
         soup = BeautifulSoup(html_content, "html.parser")
         for tag in soup(["script", "style", "noscript", "svg", "math", "table"]):
             tag.decompose()
@@ -227,7 +230,7 @@ class Tools:
 
         return self._truncate_text(lines, max_chars)
 
-    def _extract_abs_page_text(self, html_content: str, max_chars: int) -> str:
+    def _extract_abs_page_text(self, html_content: str, max_chars: Optional[int]) -> str:
         soup = BeautifulSoup(html_content, "html.parser")
         lines: list[str] = []
 
@@ -467,12 +470,12 @@ class Tools:
         title: str,
         paper_id: str = "",
         author_hint: str = "",
-        max_chars: int = 8000,
+        max_chars: Optional[int] = None,
         __user__: dict = {},
         __event_emitter__: Optional[Callable[[Any], Awaitable[None]]] = None,
     ) -> str:
         """
-        Find a specific astronomy paper and load bounded HTML text suitable for summarization.
+        Find a specific astronomy paper and load HTML text suitable for summarization.
 
         Use this when the user asks to retrieve, read, or summarize a specific paper by title.
 
@@ -480,7 +483,8 @@ class Tools:
             title: Paper title or near-exact title to retrieve.
             paper_id: Optional arXiv id for exact lookup (preferred when available).
             author_hint: Optional author hint such as a surname or initials.
-            max_chars: Maximum number of extracted text characters to return inline.
+            max_chars: Optional maximum number of extracted text characters to return.
+                If omitted or <= 0, returns the full extracted HTML text.
 
         Returns:
             Paper metadata plus HTML-derived text content for the selected paper.

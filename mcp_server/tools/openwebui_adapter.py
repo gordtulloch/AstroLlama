@@ -8,7 +8,7 @@ import types as pytypes
 import uuid
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Any, Callable, get_args, get_origin, Literal, Union
+from typing import Any, Callable, get_args, get_origin, get_type_hints, Literal, Union
 
 import mcp.types as types
 
@@ -263,6 +263,10 @@ def build_tool_specs(tools_obj: Any) -> dict[str, OpenWebUIToolSpec]:
             continue
 
         sig = inspect.signature(method)
+        try:
+            resolved_hints = get_type_hints(method)
+        except Exception:
+            resolved_hints = {}
         doc = inspect.getdoc(method) or ""
         summary, param_desc, returns_desc = _parse_sphinx_docstring(doc)
 
@@ -272,7 +276,8 @@ def build_tool_specs(tools_obj: Any) -> dict[str, OpenWebUIToolSpec]:
         for param_name, param in sig.parameters.items():
             if param_name == "self":
                 continue
-            schema = _annotation_to_schema(param.annotation)
+            annotation = resolved_hints.get(param_name, param.annotation)
+            schema = _annotation_to_schema(annotation)
             if param_name in param_desc and param_desc[param_name]:
                 schema["description"] = param_desc[param_name]
             if param.default is not inspect._empty:

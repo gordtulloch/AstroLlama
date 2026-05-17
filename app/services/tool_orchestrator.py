@@ -9,6 +9,8 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 from app.models.chat import ChatSettings
 from app.services.llm import LLMClient, LlamaServerUnavailableError
 from app.services.mcp_client import MCPClient
@@ -58,6 +60,154 @@ _TOOL_NAME_QUERY_KEYS = {
     "star",
     "designation",
 }
+
+_LATLONG_INTENT_RE = re.compile(
+    r"\b(latitude\s*(?:and|&)\s*longitude|latitude|longitude|lat\s*/?\s*long|lat\s+lon|coordinates?)\b",
+    re.IGNORECASE,
+)
+
+_AAVSO_FINDER_INTENT_RE = re.compile(
+    r"\b(aavso|finder\s+chart|variable\s+star\s+finder\s+chart)\b",
+    re.IGNORECASE,
+)
+
+
+def _extract_location_for_latlong_query(text: str) -> str | None:
+    """Best-effort extraction of location text from a lat/long user query."""
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+
+    lowered = raw.lower()
+    if not _LATLONG_INTENT_RE.search(lowered):
+        return None
+
+    patterns = [
+        r"\b(?:what(?:'s| is)?\s+)?(?:the\s+)?(?:latitude\s*(?:and|&)\s*longitude|coordinates?)\s+(?:of|for)\s+(.+)$",
+        r"\b(?:lat(?:itude)?\s*/?\s*long(?:itude)?|lat\s+lon)\s+(?:of|for)\s+(.+)$",
+        r"\b(?:where\s+is)\s+(.+?)\s*(?:located)?\s*$",
+    ]
+    for pat in patterns:
+        m = re.search(pat, lowered, flags=re.IGNORECASE)
+        if m:
+            candidate = raw[m.start(1):m.end(1)].strip(" ?.!,:;")
+            if candidate:
+                return candidate
+
+    # Fallback: if the question is location-focused but extraction failed,
+    # return the full text and let the geocoder fallback logic try to resolve it.
+    return raw.strip(" ?.!")
+
+
+def _extract_aavso_star_query(text: str) -> str | None:
+    """Best-effort extraction of variable star target for AAVSO finder-chart requests."""
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+
+    if not _AAVSO_FINDER_INTENT_RE.search(raw):
+        return None
+
+    patterns = [
+        r"\b(?:aavso\s+)?(?:variable\s+star\s+finder\s+chart|finder\s+chart|chart)\s+(?:for|of)\s+(.+)$",
+        r"\b(?:create|generate|show|make|build)\s+(?:an?\s+)?aavso\s+(?:finder\s+)?chart\s+(?:for|of)\s+(.+)$",
+    ]
+    for pat in patterns:
+        m = re.search(pat, raw, flags=re.IGNORECASE)
+        if m:
+            candidate = raw[m.start(1):m.end(1)].strip(" ?.!,:;")
+            if candidate:
+                return candidate
+
+    # Fall back to using text after the last "for"/"of" if it looks explicit.
+    fallback = re.search(r"\b(?:for|of)\s+(.+)$", raw, flags=re.IGNORECASE)
+    if fallback:
+        candidate = raw[fallback.start(1):fallback.end(1)].strip(" ?.!,:;")
+        if candidate:
+            return candidate
+
+    return None
+
+
+def _find_tool_name(tools: list[dict[str, Any]], candidates: list[str]) -> str | None:
+    available = {
+        (t.get("function") or {}).get("name")
+        for t in tools
+        if isinstance(t, dict)
+    }
+    for name in candidates:
+        if name in available:
+            return name
+    return None
+
+
+def _summarize_geocode_result(result: str, requested_location: str) -> str:
+    """Create a concise user-facing lat/long answer from tool output."""
+    lat_match = re.search(r"Latitude:\s*([-+]?\d+(?:\.\d+)?)", result, flags=re.IGNORECASE)
+    lon_match = re.search(r"Longitude:\s*([-+]?\d+(?:\.\d+)?)", result, flags=re.IGNORECASE)
+    name_match = re.search(r"^\s*1\.\s+(.+)$", result, flags=re.MULTILINE)
+
+    if lat_match and lon_match:
+        place = (name_match.group(1).strip() if name_match else requested_location) or requested_location
+        lat = lat_match.group(1)
+        lon = lon_match.group(1)
+        return f"{place}: latitude {lat}, longitude {lon}."
+
+    # Fall back to raw tool text when parsing fails.
+    return result
+
+
+async def _direct_geocode_summary(location: str) -> str | None:
+    """Best-effort direct geocode fallback if MCP geocode tool call fails."""
+    location = str(location or "").strip()
+    if not location:
+        return None
+
+    terms: list[str] = [location]
+    if "," not in location:
+        parts = [p for p in location.split() if p]
+        if len(parts) >= 2:
+            terms.append(f"{parts[0]}, {' '.join(parts[1:])}")
+            terms.append(parts[0])
+        elif len(parts) == 1:
+            terms.append(parts[0])
+
+    seen: set[str] = set()
+    deduped_terms: list[str] = []
+    for term in terms:
+        key = term.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped_terms.append(term)
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        for term in deduped_terms:
+            params = {"name": term, "count": 1, "language": "en", "format": "json"}
+            try:
+                resp = await client.get("https://geocoding-api.open-meteo.com/v1/search", params=params)
+                resp.raise_for_status()
+            except Exception:
+                continue
+            data = resp.json()
+            results = data.get("results", [])
+            if not results:
+                continue
+
+            r = results[0]
+            name_parts = [r.get("name", "")]
+            for field in ("admin1", "country"):
+                v = r.get(field)
+                if v:
+                    name_parts.append(v)
+            place = ", ".join([p for p in name_parts if p]) or location
+            lat = r.get("latitude")
+            lon = r.get("longitude")
+            if lat is None or lon is None:
+                continue
+            return f"{place}: latitude {lat}, longitude {lon}."
+
+    return None
 
 
 def _sanitize_prompt_text(text: str) -> str:
@@ -307,9 +457,65 @@ async def run_chat(
       {"type": "error",       "message": "..."}
     """
     tools = mcp_client.tools if mcp_client.available else []
+    emit_tool_events = not settings.hide_tool_bubbles
     logger.debug("run_chat: %d tool(s) available to model: %s",
                 len(tools),
                 [t["function"]["name"] for t in tools] or "(none)")
+
+    # Deterministic fast-path for explicit coordinate questions.
+    last_user_text = ""
+    for msg in reversed(history):
+        if msg.get("role") == "user":
+            last_user_text = str(msg.get("content") or "")
+            break
+
+    location_query = _extract_location_for_latlong_query(last_user_text)
+    geocode_tool = _find_tool_name(tools, ["get_lat_long", "get_latlong"])
+    if location_query and geocode_tool:
+        args = {"location": location_query}
+        if emit_tool_events:
+            yield {"type": "tool_start", "name": geocode_tool, "args": args}
+        logger.info("Lat/long fast-path tool call → %s  args=%s", geocode_tool, json.dumps(args, ensure_ascii=False))
+        try:
+            raw_result = await mcp_client.call_tool(geocode_tool, args)
+            result_str = _serialize_tool_result(raw_result)
+            if emit_tool_events:
+                yield {"type": "tool_result", "name": geocode_tool, "result": result_str}
+            summary = _summarize_geocode_result(result_str, location_query)
+            yield {"type": "token", "text": summary}
+            yield {"type": "done"}
+            return
+        except Exception as exc:
+            logger.warning("Lat/long fast-path failed, falling back to normal flow: %s", exc)
+            if emit_tool_events:
+                yield {"type": "tool_error", "name": geocode_tool, "error": str(exc)}
+            direct_summary = await _direct_geocode_summary(location_query)
+            if direct_summary:
+                yield {"type": "token", "text": direct_summary}
+                yield {"type": "done"}
+                return
+
+    # Deterministic fast-path for explicit AAVSO finder chart requests.
+    aavso_target = _extract_aavso_star_query(last_user_text)
+    aavso_tool = _find_tool_name(tools, ["generate_aavso_map"])
+    if aavso_target and aavso_tool:
+        args = {"star": aavso_target}
+        if emit_tool_events:
+            yield {"type": "tool_start", "name": aavso_tool, "args": args}
+        logger.info("AAVSO fast-path tool call → %s  args=%s", aavso_tool, json.dumps(args, ensure_ascii=False))
+        try:
+            raw_result = await mcp_client.call_tool(aavso_tool, args)
+            result_str = _serialize_tool_result(raw_result)
+            if emit_tool_events:
+                yield {"type": "tool_result", "name": aavso_tool, "result": result_str}
+                image_url = _extract_image_url(result_str)
+                if image_url:
+                    yield {"type": "tool_image", "name": aavso_tool, "url": image_url}
+            yield {"type": "token", "text": result_str}
+            yield {"type": "done"}
+            return
+        except Exception as exc:
+            logger.warning("AAVSO fast-path failed, falling back to normal flow: %s", exc)
 
     # --- RAG: build a one-shot messages list with context appended to the
     #     system prompt. We never mutate the stored history. ----------------
@@ -327,11 +533,20 @@ async def run_chat(
             "   - simbad_lookup_object: use for ONE specific object (e.g. coordinates/properties of NGC 1015).\n"
             "   - simbad_search: use for multi-result list/browse queries (e.g. 'brightest stars', 'galaxies in Orion').\n"
             "     Never call either SIMBAD tool to answer general astronomy questions, explain concepts, or as a fallback.\n"
+            "   - search_papers: ONLY if the user explicitly asks for papers, literature, or published research.\n"
+            "     Never use to answer general astronomy questions (e.g., not for 'What are variable stars?').\n"
+            "   - load_paper_html_text: When user asks to retrieve/read/summarize a specific paper.\n"
+            "     This tool returns complete paper content. After calling it, summarize the content directly\n"
+            "     WITHOUT calling any other tool. NEVER follow with summarize_news or any other tool.\n"
+            "   - summarize_news: ONLY for news articles and current events.\n"
+            "     NEVER use for arXiv papers or academic content.\n"
             "   - generate_constellation_map / generate_map: ONLY if the user asks to SEE or SHOW a chart or map.\n"
             "   - get_weather / get_latlong: ONLY for explicit weather or location queries.\n"
             "   - get_current_time: ONLY when the user asks what time it is.\n"
             "5. If you do not know something, say so plainly. Do NOT call a tool as a substitute for not knowing.\n"
-            "6. Do NOT call any tool more than once for the same question.\n"
+            "6. Do NOT call any tool more than once for the same question. In particular:\n"
+            "   - After load_paper_html_text returns content, summarize it directly (no follow-up tools).\n"
+            "   - After simbad tools return results, answer directly (no follow-up data lookups).\n"
         ) if "simbad_search" in tool_names else ""
         if simbad_hint:
             llm_messages[0] = {
@@ -374,6 +589,8 @@ async def run_chat(
                 logger.debug("RAG: injected %d chunk(s) into context", len(chunks))
 
     pending_image_url: str | None = None
+    called_tool_names: set[str] = set()
+    force_no_more_tools = False
 
     for iteration in range(_MAX_TOOL_ITERATIONS):
         # Trim history to avoid exceeding the model's context window.
@@ -454,6 +671,26 @@ async def run_chat(
 
         for tc in tool_calls:
             name = tc["function"]["name"]
+
+            if name in called_tool_names:
+                duplicate_msg = (
+                    f"Tool '{name}' was already called for this question. "
+                    "Do not call it again; use the existing result and answer directly."
+                )
+                logger.info("Tool call blocked (duplicate) → %s", name)
+                if emit_tool_events:
+                    yield {"type": "tool_error", "name": name, "error": duplicate_msg}
+                tool_msg: dict[str, Any] = {
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": duplicate_msg,
+                }
+                history.append(tool_msg)
+                llm_messages.append(tool_msg)
+                tools = []
+                force_no_more_tools = True
+                continue
+
             try:
                 args: dict[str, Any] = json.loads(tc["function"]["arguments"] or "{}")
             except json.JSONDecodeError:
@@ -467,11 +704,13 @@ async def run_chat(
                     json.dumps(disambiguation_changes, ensure_ascii=False),
                 )
 
-            yield {"type": "tool_start", "name": name, "args": args}
+            if emit_tool_events:
+                yield {"type": "tool_start", "name": name, "args": args}
             logger.info("Tool call → %s  args=%s", name, json.dumps(args, ensure_ascii=False)[:200])
 
             try:
                 raw_result = await mcp_client.call_tool(name, args)
+                called_tool_names.add(name)
                 result_str = _serialize_tool_result(raw_result)
                 logger.info("Tool result ← %s  (%d chars)\n%s",
                             name, len(result_str),
@@ -481,13 +720,14 @@ async def run_chat(
                     filename, url = _save_large_result(name, result_str)
                     logger.debug("Large result saved → %s", filename)
                     preview = result_str[:_LLM_PREVIEW_LEN]
-                    yield {
-                        "type": "tool_download",
-                        "name": name,
-                        "url": url,
-                        "size": len(result_str),
-                        "preview": preview,
-                    }
+                    if emit_tool_events:
+                        yield {
+                            "type": "tool_download",
+                            "name": name,
+                            "url": url,
+                            "size": len(result_str),
+                            "preview": preview,
+                        }
                     # Give the LLM a short summary so it can refer to the file
                     llm_content = (
                         f"[Result set too large to include inline ({len(result_str):,} chars). "
@@ -495,13 +735,15 @@ async def run_chat(
                         f"Preview (first {_LLM_PREVIEW_LEN} chars):\n{preview}]"
                     )
                 else:
-                    yield {"type": "tool_result", "name": name, "result": result_str}
+                    if emit_tool_events:
+                        yield {"type": "tool_result", "name": name, "result": result_str}
                     # Emit an inline image event when the result contains a PNG URL
                     image_url = _extract_image_url(result_str)
                     logger.info("Tool image URL extracted from %s result: %s", name, image_url)
                     if image_url:
                         pending_image_url = image_url
-                        yield {"type": "tool_image", "name": name, "url": image_url}
+                        if emit_tool_events:
+                            yield {"type": "tool_image", "name": name, "url": image_url}
                     llm_content = _prepare_llm_tool_content(name, result_str)
 
                 tool_msg: dict[str, Any] = {
@@ -511,10 +753,19 @@ async def run_chat(
                 }
                 history.append(tool_msg)
                 llm_messages.append(tool_msg)
+
+                # Paper retrieval already returns the text needed for summarization.
+                # Prevent any follow-up tool calls (e.g., summarize_news) and force
+                # the next assistant turn to summarize directly from this content.
+                if name == "load_paper_html_text":
+                    tools = []
+                    force_no_more_tools = True
+                    logger.info("Tool suppression enabled after load_paper_html_text")
             except Exception as exc:
                 error_str = str(exc)
                 logger.warning("Tool error ← %s: %s", name, error_str)
-                yield {"type": "tool_error", "name": name, "error": error_str}
+                if emit_tool_events:
+                    yield {"type": "tool_error", "name": name, "error": error_str}
                 error_msg: dict[str, Any] = {
                     "role": "tool",
                     "tool_call_id": tc["id"],
@@ -529,7 +780,11 @@ async def run_chat(
                 # Strip tools so the follow-up LLM call is forced to answer
                 # from knowledge rather than attempting another tool call.
                 tools = []
+                force_no_more_tools = True
                 logger.debug("Tool error — tools suppressed for follow-up LLM call")
+
+        if force_no_more_tools:
+            tools = []
 
         # Loop back for next LLM call with tool results injected
 

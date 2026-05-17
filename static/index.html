@@ -46,9 +46,14 @@
         <img id="sidebar-logo-footer" src="astrollama.png" alt="AstroLlama Logo" />
       </div>
     </aside>
+    <div id="sidebar-backdrop" aria-hidden="true"></div>
 
     <!-- Main chat area -->
     <main id="main">
+      <div id="mobile-topbar">
+        <button id="btn-sidebar-toggle" class="btn-secondary" type="button" aria-expanded="false" aria-controls="sidebar">Menu</button>
+        <span class="mobile-title">AstroLlama</span>
+      </div>
       <div id="messages"></div>
 
       <div id="input-area">
@@ -61,11 +66,12 @@
         <div id="input-controls">
           <button id="btn-send" class="btn-primary">Send</button>
           <button id="btn-mic" class="btn-secondary" title="Start voice input" aria-pressed="false">Mic</button>
-          <button id="btn-viz-fullscreen" class="btn-secondary" title="Open full screen visualization" aria-pressed="false">Full Screen Visual</button>
-          <button id="btn-tts" class="btn-secondary" title="Toggle read-aloud" aria-pressed="false">Voice Off</button>
-          <button id="btn-cancel" class="btn-danger" disabled>Cancel</button>
-          <button id="btn-tools" class="btn-secondary" title="Configure tool valves">Tools &#9881;</button>
-          <details id="settings-panel">
+          <button id="btn-more-actions" class="btn-secondary" type="button" aria-expanded="false" aria-controls="input-controls">More</button>
+          <button id="btn-viz-fullscreen" class="btn-secondary secondary-action" title="Open full screen visualization" aria-pressed="false">Full Screen Visual</button>
+          <button id="btn-tts" class="btn-secondary secondary-action" title="Toggle read-aloud" aria-pressed="false">Voice Off</button>
+          <button id="btn-cancel" class="btn-danger secondary-action" disabled>Cancel</button>
+          <button id="btn-tools" class="btn-secondary secondary-action" title="Configure tool valves">Tools &#9881;</button>
+          <details id="settings-panel" class="secondary-action">
             <summary>&#9881; Settings</summary>
             <div class="settings-grid">
               <label>Temperature
@@ -100,6 +106,14 @@
               <label class="full-width">
                 <input type="checkbox" id="s-viz-fullscreen-default" />
                 Open visualization in full screen instead of chat window
+              </label>
+              <label class="full-width">
+                <input type="checkbox" id="s-hide-tool-bubbles" />
+                Hide tool bubbles in assistant messages
+              </label>
+              <label class="full-width">
+                <input type="checkbox" id="s-disable-voice-processing" />
+                Hide voice buttons and disable voice processing
               </label>
             </div>
           </details>
@@ -148,6 +162,6 @@
   <!-- MSAL is loaded dynamically by app.js with fallback CDN support -->
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <script src="js/features/tools/valvesModal.js?v=20260509d"></script>
-  <script src="app.js?v=20260509i"></script>
+  <script src="app.js?v=20260516a"></script>
 </body>
 </html>

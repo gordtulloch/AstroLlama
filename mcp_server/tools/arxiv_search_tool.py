@@ -5,7 +5,9 @@ author: AstroLlama
 version: 0.4.0
 """
 
+import asyncio
 import re
+import time
 from difflib import SequenceMatcher
 from typing import Any, Optional, Callable, Awaitable
 from urllib.parse import quote
@@ -26,6 +28,69 @@ class Tools:
         self.base_url = "https://export.arxiv.org/api/query"
         self.max_results = 5
         self.citation = False
+
+    async def _make_request_with_retry(
+        self,
+        client: httpx.AsyncClient,
+        method: str,
+        url: str,
+        max_retries: int = 5,
+        initial_delay: float = 1.0,
+        **kwargs: Any
+    ) -> httpx.Response:
+        """
+        Make an HTTP request with exponential backoff retry logic for rate limiting (429 errors).
+        
+        Args:
+            client: httpx.AsyncClient instance
+            method: HTTP method (GET, POST, etc.)
+            url: URL to request
+            max_retries: Maximum number of retries (default 5)
+            initial_delay: Initial delay in seconds before first retry (default 1.0)
+            **kwargs: Additional arguments to pass to client.request()
+            
+        Returns:
+            httpx.Response object
+            
+        Raises:
+            httpx.HTTPError: If all retries are exhausted
+        """
+        delay = initial_delay
+        
+        for attempt in range(max_retries):
+            try:
+                response = await client.request(method, url, **kwargs)
+                
+                # If it's a 429 (Too Many Requests), retry with backoff
+                if response.status_code == 429:
+                    if attempt < max_retries - 1:
+                        # Check for Retry-After header
+                        retry_after = response.headers.get("retry-after")
+                        if retry_after:
+                            try:
+                                delay = float(retry_after)
+                            except (ValueError, TypeError):
+                                pass
+                        
+                        await asyncio.sleep(delay)
+                        delay *= 2  # Exponential backoff
+                        continue
+                    # Last attempt, let it fail below
+                
+                # For other status codes, raise immediately
+                response.raise_for_status()
+                return response
+                
+            except httpx.HTTPError as e:
+                if attempt < max_retries - 1:
+                    # Retry on connection errors
+                    await asyncio.sleep(delay)
+                    delay *= 2
+                else:
+                    raise
+        
+        # Shouldn't reach here, but just in case
+        raise httpx.HTTPError(f"Failed after {max_retries} retries")
 
     @staticmethod
     def _normalize_title(text: str) -> str:
@@ -51,8 +116,7 @@ class Tools:
 
     def _format_results(self, topic: str, entries: list[dict[str, str]]) -> str:
         lines = [
-            f"Latest astronomy papers on '{topic}' in arXiv astro-ph.",
-            "Click a title to open its abstract page:",
+            f"Here are some new items regarding {topic}:",
             "",
         ]
 
@@ -60,19 +124,16 @@ class Tools:
             title_text = self._escape_markdown(entry.get("title", "Unknown Title"))
             link = entry.get("id")
             urls = self._paper_urls(link) if link else {}
-            link_text = urls.get("abstract", "No link available")
-            html_text = urls.get("ar5iv", "No link available")
+            link_text = urls.get("html") or urls.get("ar5iv") or urls.get("abstract", "No link available")
             summarize_link = (
                 "astrollama://summarize?"
                 f"title={quote(entry.get('title', ''))}"
                 f"&paper_id={quote(link or '')}"
             )
-            category = entry.get("category", "astro-ph")
-            pub_date = entry.get("published", "Unknown Date")
             lines.append(
-                f"{index}. [{title_text}]({link_text}) ([HTML text]({html_text})) ([Summarize]({summarize_link}))"
+                f"{index}. [{title_text}]({link_text}) - "
+                f"[Summarize]({summarize_link})"
             )
-            lines.append(f"   {category} | {pub_date}")
 
         return "\n".join(lines)
 
@@ -230,8 +291,9 @@ class Tools:
             "sortBy": "submittedDate",
             "sortOrder": "descending",
         }
-        response = await client.get(self.base_url, params=params, headers=headers)
-        response.raise_for_status()
+        response = await self._make_request_with_retry(
+            client, "GET", self.base_url, params=params, headers=headers
+        )
         return self._parse_feed(response.text)
 
     async def _query_entry_by_id(self, client: httpx.AsyncClient, paper_id: str) -> list[dict[str, str]]:
@@ -243,22 +305,23 @@ class Tools:
         normalized = (paper_id or "").strip()
         if not normalized:
             return []
-        response = await client.get(
-            self.base_url,
+        
+        # Try with version-stripped ID first
+        response = await self._make_request_with_retry(
+            client, "GET", self.base_url,
             params={"id_list": self._strip_version(normalized)},
             headers=headers,
         )
-        response.raise_for_status()
         entries = self._parse_feed(response.text)
         if entries:
             return entries
 
-        response = await client.get(
-            self.base_url,
+        # Try with full ID (including version)
+        response = await self._make_request_with_retry(
+            client, "GET", self.base_url,
             params={"id_list": normalized},
             headers=headers,
         )
-        response.raise_for_status()
         return self._parse_feed(response.text)
 
     @staticmethod
@@ -309,14 +372,17 @@ class Tools:
         __event_emitter__: Optional[Callable[[Any], Awaitable[None]]] = None,
     ) -> str:
         """
-        Search the official arXiv API for astronomy papers and return formatted results.
+        Search arXiv for astronomy papers ONLY when the user explicitly asks for literature, papers, or published research.
+
+        Use this tool ONLY when the user explicitly requests papers, literature, or published research on a topic.
+        Do NOT use this tool to answer general astronomy questions or as a fallback for unknown topics.
+        Example: use for "Find papers on exoplanet atmospheres" but NOT for "What are exoplanet atmospheres?"
 
         Args:
-            topic: Astronomy topic to search for (e.g., "exoplanet atmospheres")
+            topic: Astronomy topic to search for in literature (e.g., "exoplanet atmospheres")
 
         Returns:
-            Formatted string containing paper details including titles, authors, dates,
-            URLs and abstracts.
+            Formatted string containing paper details including titles, authors, dates, URLs and abstracts.
         """
         if __event_emitter__:
             await __event_emitter__(
@@ -466,16 +532,22 @@ class Tools:
                     ("Native HTML", urls["html"], self._extract_html_text),
                     ("Abstract page", urls["abstract"], self._extract_abs_page_text),
                 ):
-                    response = await client.get(url)
-                    if response.status_code >= 400:
+                    try:
+                        response = await self._make_request_with_retry(
+                            client, "GET", url, max_retries=3
+                        )
+                        if response.status_code >= 400:
+                            continue
+                        if label != "Abstract page" and self._html_unavailable(response.text):
+                            continue
+                        extracted_text = extractor(response.text, max_chars)
+                        if extracted_text:
+                            source_label = label
+                            source_url = url
+                            break
+                    except httpx.HTTPError:
+                        # Try next source on error
                         continue
-                    if label != "Abstract page" and self._html_unavailable(response.text):
-                        continue
-                    extracted_text = extractor(response.text, max_chars)
-                    if extracted_text:
-                        source_label = label
-                        source_url = url
-                        break
 
                 if not extracted_text:
                     return (

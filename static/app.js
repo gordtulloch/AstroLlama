@@ -50,6 +50,12 @@
   const authUser     = document.getElementById("auth-user");
   const btnLogin     = document.getElementById("btn-login");
   const btnLogout    = document.getElementById("btn-logout");
+  const appEl        = document.getElementById("app");
+  const sidebarEl    = document.getElementById("sidebar");
+  const sidebarBackdrop = document.getElementById("sidebar-backdrop");
+  const btnSidebarToggle = document.getElementById("btn-sidebar-toggle");
+  const inputControls = document.getElementById("input-controls");
+  const btnMoreActions = document.getElementById("btn-more-actions");
 
   const toolValvesController = window.createToolValvesController
     ? window.createToolValvesController({ apiFetch })
@@ -65,10 +71,14 @@
   const sVoicePitch   = document.getElementById("s-voice-pitch");
   const sReactiveOrb  = document.getElementById("s-reactive-orb");
   const sVizFullscreenDefault = document.getElementById("s-viz-fullscreen-default");
+  const sHideToolBubbles = document.getElementById("s-hide-tool-bubbles");
+  const sDisableVoiceProcessing = document.getElementById("s-disable-voice-processing");
 
   const ui = {
     preferFullscreenViz: false,
     voiceStartRequired: false,
+    hideToolBubbles: false,
+    voiceDisabled: false,
   };
 
   const VOICE_START_KEY = "chat_voice_started_once";
@@ -133,9 +143,21 @@
       if (typeof saved.open_viz_fullscreen === "boolean") {
         ui.preferFullscreenViz = saved.open_viz_fullscreen;
       }
+      if (typeof saved.hide_tool_bubbles === "boolean") {
+        ui.hideToolBubbles = saved.hide_tool_bubbles;
+      }
+      if (typeof saved.disable_voice_processing === "boolean") {
+        ui.voiceDisabled = saved.disable_voice_processing;
+      }
     } catch (_) {}
     if (sVizFullscreenDefault) {
       sVizFullscreenDefault.checked = ui.preferFullscreenViz;
+    }
+    if (sHideToolBubbles) {
+      sHideToolBubbles.checked = ui.hideToolBubbles;
+    }
+    if (sDisableVoiceProcessing) {
+      sDisableVoiceProcessing.checked = ui.voiceDisabled;
     }
   }
 
@@ -146,7 +168,107 @@
       max_tokens:    parseInt(sMaxTokens.value, 10),
       system_prompt: sSystemPrompt.value,
       open_viz_fullscreen: ui.preferFullscreenViz,
+      hide_tool_bubbles: ui.hideToolBubbles,
+      disable_voice_processing: ui.voiceDisabled,
     }));
+  }
+
+  function isVoiceProcessingDisabled() {
+    return Boolean(ui.voiceDisabled);
+  }
+
+  function setVoiceUiVisible(visible) {
+    const voiceElements = [
+      btnMic,
+      btnVizFullscreen,
+      btnTts,
+      btnVoicePreview,
+      sVoice,
+      sVoiceRate,
+      sVoicePitch,
+      sReactiveOrb,
+    ];
+
+    for (const el of voiceElements) {
+      if (!el) continue;
+      const host = el.closest("label") || el;
+      host.classList.toggle("voice-hidden-by-setting", !visible);
+    }
+  }
+
+  function applyVoiceProcessingSetting() {
+    const voiceEnabled = !isVoiceProcessingDisabled();
+    setVoiceUiVisible(voiceEnabled);
+
+    if (voiceStartGate) {
+      voiceStartGate.toggleAttribute("inert", !voiceEnabled);
+    }
+    if (btnVoiceStart) {
+      btnVoiceStart.disabled = !voiceEnabled;
+    }
+
+    if (!voiceEnabled) {
+      ui.voiceStartRequired = false;
+      hideVoiceStartGate();
+      if (speech.listening) {
+        stopSpeechRecognition();
+      }
+      speech.userStopped = true;
+      speech.awaitingWake = true;
+      speech.keepArmed = false;
+      cancelSpeechOutput();
+      tts.enabled = false;
+      localStorage.setItem("chat_tts_enabled", "false");
+    } else {
+      ui.voiceStartRequired = Boolean((speech.supported || tts.supported) && !hasVoiceStartedOnce());
+      if (ui.voiceStartRequired) {
+        showVoiceStartGate();
+      } else {
+        hideVoiceStartGate();
+      }
+      if (speech.recognition && !speech.listening && !ui.voiceStartRequired) {
+        speech.userStopped = false;
+        startSpeechRecognition();
+      }
+    }
+
+    updateTtsButtonState();
+    setMicButtonState();
+    updateSidebarPulse();
+  }
+
+  function isCompactLayout() {
+    return window.matchMedia("(max-width: 834px)").matches;
+  }
+
+  function isPhoneLayout() {
+    return window.matchMedia("(max-width: 640px)").matches;
+  }
+
+  function setSidebarOpen(open) {
+    if (!appEl || !sidebarEl) return;
+    const nextOpen = Boolean(open) && isCompactLayout();
+    appEl.classList.toggle("sidebar-open", nextOpen);
+    document.body.classList.toggle("sidebar-open", nextOpen);
+    if (sidebarBackdrop) {
+      sidebarBackdrop.setAttribute("aria-hidden", nextOpen ? "false" : "true");
+    }
+    if (btnSidebarToggle) {
+      btnSidebarToggle.setAttribute("aria-expanded", nextOpen ? "true" : "false");
+    }
+  }
+
+  function closeSidebarIfCompact() {
+    if (!isCompactLayout()) return;
+    setSidebarOpen(false);
+  }
+
+  function setMoreActionsOpen(open) {
+    if (!inputControls || !btnMoreActions) return;
+    const nextOpen = Boolean(open) && isPhoneLayout();
+    inputControls.classList.toggle("more-open", nextOpen);
+    btnMoreActions.setAttribute("aria-expanded", nextOpen ? "true" : "false");
+    btnMoreActions.textContent = nextOpen ? "Less" : "More";
   }
 
   [sTemperature, sTopP, sMaxTokens, sSystemPrompt].forEach(el =>
@@ -204,6 +326,7 @@
   }
 
   function completeVoiceStart(source = "voice_start") {
+    if (isVoiceProcessingDisabled()) return;
     markTtsGestureUnlocked(source);
     tts.enabled = true;
     localStorage.setItem("chat_tts_enabled", "true");
@@ -463,6 +586,14 @@
 
   function updateTtsButtonState() {
     if (!btnTts) return;
+    if (isVoiceProcessingDisabled()) {
+      btnTts.disabled = true;
+      btnTts.classList.remove("enabled");
+      btnTts.setAttribute("aria-pressed", "false");
+      btnTts.textContent = "Voice Off";
+      btnTts.title = "Voice features are disabled in Settings";
+      return;
+    }
     const canUse = tts.supported;
     btnTts.disabled = !canUse;
     btnTts.classList.toggle("enabled", tts.enabled);
@@ -760,6 +891,7 @@
   }
 
   function enqueueStreamingSpeech(text) {
+    if (isVoiceProcessingDisabled()) return;
     if (!tts.supported || !tts.enabled) return;
     if (!text) return;
 
@@ -768,11 +900,13 @@
   }
 
   function flushStreamingSpeech() {
+    if (isVoiceProcessingDisabled()) return;
     if (!tts.supported || !tts.enabled) return;
     drainSpeechStreamBuffer(getPreferredVoice(), true);
   }
 
   function speakText(text) {
+    if (isVoiceProcessingDisabled()) return;
     if (!tts.supported || !tts.enabled) return;
     const message = normalizeForSpeech(text);
     if (!message) return;
@@ -788,6 +922,7 @@
   }
 
   function speakWakeGreeting(text, options = {}) {
+    if (isVoiceProcessingDisabled()) return;
     if (!tts.supported || !tts.enabled) {
       logSpeechDebug("wake_tts_skip", {
         text: !tts.supported ? "tts_not_supported" : "tts_disabled",
@@ -970,6 +1105,7 @@
     installTtsGestureUnlockListeners();
 
     btnTts.addEventListener("click", () => {
+      if (isVoiceProcessingDisabled()) return;
       markTtsGestureUnlocked("voice_button_click");
       tts.enabled = !tts.enabled;
       if (!tts.enabled) {
@@ -1023,6 +1159,7 @@
 
     if (btnVoicePreview) {
       btnVoicePreview.addEventListener("click", () => {
+        if (isVoiceProcessingDisabled()) return;
         markTtsGestureUnlocked("voice_preview_click");
         const wasEnabled = tts.enabled;
         tts.enabled = true;
@@ -1262,6 +1399,15 @@
 
   function setMicButtonState() {
     if (!btnMic) return;
+    if (isVoiceProcessingDisabled()) {
+      btnMic.disabled = true;
+      btnMic.classList.remove("listening", "blocked");
+      btnMic.setAttribute("aria-pressed", "false");
+      btnMic.textContent = "Mic";
+      btnMic.title = "Voice features are disabled in Settings";
+      updateSidebarPulse();
+      return;
+    }
     const micActive = speech.listening || speech.monitoringTts;
     const disabled = !speech.supported || speech.monitoringTts || tts.speaking;
     const entraDirectMode = isEntraSignedIn();
@@ -1365,6 +1511,7 @@
   }
 
   function startSpeechRecognition() {
+    if (isVoiceProcessingDisabled()) return;
     if (!speech.recognition || speech.listening) return;
     speech.userStopped = false;
     speech.blockedReason = "";
@@ -1627,6 +1774,7 @@
     speech.recognition = recognition;
 
     btnMic.addEventListener("click", () => {
+      if (isVoiceProcessingDisabled()) return;
       if (ui.voiceStartRequired) {
         completeVoiceStart("mic_button_click");
         return;
@@ -1643,7 +1791,7 @@
     });
 
     setMicButtonState();
-    if (!ui.voiceStartRequired) {
+    if (!ui.voiceStartRequired && !isVoiceProcessingDisabled()) {
       startSpeechRecognition();
     }
   }
@@ -2154,7 +2302,10 @@
 
         li.appendChild(nameSpan);
         li.appendChild(delBtn);
-        li.addEventListener("click", () => loadConv(conv.id));
+        li.addEventListener("click", () => {
+          closeSidebarIfCompact();
+          loadConv(conv.id);
+        });
         convList.appendChild(li);
       });
     } catch (_) {}
@@ -2207,6 +2358,7 @@
         top_p:         parseFloat(sTopP.value),
         max_tokens:    parseInt(sMaxTokens.value, 10),
         system_prompt: sSystemPrompt.value,
+        hide_tool_bubbles: ui.hideToolBubbles,
       },
     };
     const r = await apiFetch("/api/conversations", {
@@ -2269,8 +2421,9 @@
     const params = new URLSearchParams(query);
     const title = (params.get("title") || "").trim();
     const paperId = (params.get("paper_id") || "").trim();
+    const articleUrl = (params.get("article_url") || "").trim();
     if (!title) return null;
-    return { title, paperId };
+    return { title, paperId, articleUrl };
   }
 
   // ---- Tool call details block (inside an assistant message) -------
@@ -2467,6 +2620,7 @@
         top_p:         parseFloat(sTopP.value),
         max_tokens:    parseInt(sMaxTokens.value, 10),
         system_prompt: sSystemPrompt.value || null,
+        hide_tool_bubbles: ui.hideToolBubbles,
       },
     };
 
@@ -2639,7 +2793,7 @@
   }
 
   promptInput.addEventListener("keydown", (e) => {
-    if (ui.voiceStartRequired) {
+    if (ui.voiceStartRequired && !isVoiceProcessingDisabled()) {
       completeVoiceStart("keyboard_input");
     }
     if (e.key === "Enter" && !e.shiftKey) {
@@ -2659,9 +2813,14 @@
     e.preventDefault();
     if (state.streaming) return;
 
-    const prompt = parsed.paperId
-      ? `Retrieve and summarize the arXiv paper "${parsed.title}" (arXiv:${parsed.paperId}) using load_paper_html_text.`
-      : `Retrieve and summarize the paper "${parsed.title}" using load_paper_html_text.`;
+    let prompt = "";
+    if (parsed.paperId) {
+      prompt = `Retrieve and summarize the arXiv paper "${parsed.title}" (arXiv:${parsed.paperId}) using load_paper_html_text.`;
+    } else if (parsed.articleUrl) {
+      prompt = `Retrieve and summarize the news article "${parsed.title}" from ${parsed.articleUrl} using load_news_article_text.`;
+    } else {
+      prompt = `Retrieve and summarize the paper "${parsed.title}" using load_paper_html_text.`;
+    }
     promptInput.value = prompt;
     promptInput.dispatchEvent(new Event("input", { bubbles: true }));
     sendMessage();
@@ -2672,6 +2831,10 @@
   });
 
   document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && appEl && appEl.classList.contains("sidebar-open")) {
+      setSidebarOpen(false);
+      return;
+    }
     if (e.key === "Escape" && toolValvesController && toolValvesController.isOpen()) {
       toolValvesController.close();
       return;
@@ -2708,6 +2871,21 @@
     });
   }
 
+  if (sHideToolBubbles) {
+    sHideToolBubbles.addEventListener("change", () => {
+      ui.hideToolBubbles = Boolean(sHideToolBubbles.checked);
+      saveSettings();
+    });
+  }
+
+  if (sDisableVoiceProcessing) {
+    sDisableVoiceProcessing.addEventListener("change", () => {
+      ui.voiceDisabled = Boolean(sDisableVoiceProcessing.checked);
+      saveSettings();
+      applyVoiceProcessingSetting();
+    });
+  }
+
   document.addEventListener("fullscreenchange", () => {
     const active = Boolean(document.fullscreenElement && fullscreenViz && document.fullscreenElement === fullscreenViz);
     if (!fullscreenViz) return;
@@ -2716,8 +2894,52 @@
     updateVizFullscreenButtonState();
   });
 
-  btnNewChat.addEventListener("click", newChat);
-  btnSaveConv.addEventListener("click", saveConv);
+  if (btnSidebarToggle) {
+    btnSidebarToggle.addEventListener("click", () => {
+      const currentlyOpen = Boolean(appEl && appEl.classList.contains("sidebar-open"));
+      setSidebarOpen(!currentlyOpen);
+    });
+  }
+
+  if (btnMoreActions) {
+    btnMoreActions.addEventListener("click", () => {
+      const currentlyOpen = Boolean(inputControls && inputControls.classList.contains("more-open"));
+      setMoreActionsOpen(!currentlyOpen);
+    });
+  }
+
+  if (sidebarBackdrop) {
+    sidebarBackdrop.addEventListener("click", () => {
+      setSidebarOpen(false);
+    });
+  }
+
+  window.addEventListener("resize", () => {
+    if (!isCompactLayout()) {
+      setSidebarOpen(false);
+    }
+    if (!isPhoneLayout()) {
+      setMoreActionsOpen(false);
+    }
+  });
+
+  document.addEventListener("click", (e) => {
+    if (!isPhoneLayout()) return;
+    if (!inputControls || !btnMoreActions) return;
+    const target = e.target instanceof Element ? e.target : null;
+    if (!target) return;
+    if (target.closest("#input-controls")) return;
+    setMoreActionsOpen(false);
+  });
+
+  btnNewChat.addEventListener("click", () => {
+    closeSidebarIfCompact();
+    newChat();
+  });
+  btnSaveConv.addEventListener("click", () => {
+    closeSidebarIfCompact();
+    saveConv();
+  });
   btnLogin.addEventListener("click", () => {
     console.log("[UI] Sign in button clicked");
     signIn().catch(err => {
@@ -2765,7 +2987,7 @@
     
     // Main window initialization
     loadSettings();
-    ui.voiceStartRequired = Boolean((speech.supported || tts.supported) && !hasVoiceStartedOnce());
+    ui.voiceStartRequired = Boolean(!isVoiceProcessingDisabled() && (speech.supported || tts.supported) && !hasVoiceStartedOnce());
     if (ui.voiceStartRequired) {
       showVoiceStartGate();
     } else {
@@ -2774,6 +2996,7 @@
     applyVizFullscreenPreference();
     initTextToSpeech();
     initSpeechRecognition();
+    applyVoiceProcessingSetting();
     await initHighlightStyles();
 
     try {

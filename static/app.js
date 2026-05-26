@@ -177,6 +177,16 @@
     return Boolean(ui.voiceDisabled);
   }
 
+  function isLocalhostHost(hostname) {
+    const host = String(hostname || "").toLowerCase();
+    return host === "localhost" || host === "127.0.0.1" || host === "::1";
+  }
+
+  function hasSecureMicContext() {
+    if (window.isSecureContext) return true;
+    return isLocalhostHost(window.location && window.location.hostname);
+  }
+
   function setVoiceUiVisible(visible) {
     const voiceElements = [
       btnMic,
@@ -1430,6 +1440,9 @@
     } else if (speech.monitoringTts) {
       btnMic.textContent = "Mic Live";
       btnMic.title = "Mic monitor active while speech is playing";
+    } else if (speech.blockedReason === "insecure-context") {
+      btnMic.textContent = "Mic HTTPS";
+      btnMic.title = "Microphone access requires HTTPS (or localhost). Open this site over HTTPS to use voice input.";
     } else if (speech.blockedReason === "network") {
       btnMic.textContent = "Mic Error";
       btnMic.title = speech.lastProbeResult.startsWith("silent:")
@@ -1513,6 +1526,16 @@
   function startSpeechRecognition() {
     if (isVoiceProcessingDisabled()) return;
     if (!speech.recognition || speech.listening) return;
+    if (!hasSecureMicContext()) {
+      speech.userStopped = true;
+      speech.blockedReason = "insecure-context";
+      setMicButtonState();
+      logSpeechDebug("recognition_error", {
+        text: "insecure-context",
+        extra: { error: "insecure-context" },
+      });
+      return;
+    }
     speech.userStopped = false;
     speech.blockedReason = "";
     speech.awaitingWake = true;
@@ -1745,7 +1768,7 @@
         probeSpeechMicrophone().catch(() => {});
       }
       if (errorCode === "not-allowed" || errorCode === "service-not-allowed") {
-        speech.blockedReason = errorCode;
+        speech.blockedReason = hasSecureMicContext() ? errorCode : "insecure-context";
         speech.userStopped = true;
       }
     };

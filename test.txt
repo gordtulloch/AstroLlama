@@ -1,0 +1,18 @@
+cd C:\Projects\AstroLlama
+
+# 1) Generate self-signed cert in container (if not already present)
+.\create_self_signed_cert.ps1 -Domain astrollama.openastronomy.ca
+
+# 2) Enable TLS in .env (edit if needed)
+# APP_TLS_ENABLED=true
+# APP_TLS_CERTFILE=/certs/selfsigned/astrollama.crt
+# APP_TLS_KEYFILE=/certs/selfsigned/astrollama.key
+
+# 3) Rebuild and start
+docker compose up -d --build
+
+# 4) Check app TLS startup log
+docker compose logs --no-color --tail=120 app
+
+# 5) HTTPS smoke test from server host
+Invoke-WebRequest -UseBasicParsing -Uri "https://127.0.0.1:8080/api/status" -SkipCertificateCheck

@@ -13,7 +13,27 @@ RUN apt-get update \
         g++ \
         curl \
         ca-certificates \
+        file \
+        libglib2.0-0 \
+        libgtk-3-0 \
+        libx11-6 \
+        libxext6 \
+        libxrender1 \
+        libxtst6 \
+        libxi6 \
     && rm -rf /var/lib/apt/lists/*
+
+COPY astap/*.deb /tmp/astap/
+
+RUN apt-get update \
+    && dpkg -i /tmp/astap/*.deb \
+    || (apt-get -f install -y --no-install-recommends && dpkg -i /tmp/astap/*.deb) \
+    && rm -rf /tmp/astap /var/lib/apt/lists/*
+
+ENV ASTAP_BINARY_PATH=/opt/astap/astap \
+    ASTAP_DATA_DIR=/opt/astap/data
+
+RUN mkdir -p /opt/astap/data
 
 COPY requirements.txt ./
 RUN pip install --upgrade pip \

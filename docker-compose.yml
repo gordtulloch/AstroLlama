@@ -57,14 +57,18 @@ services:
     restart: unless-stopped
     working_dir: /app
     command:
-      - python
-      - -m
-      - uvicorn
-      - app.main:app
-      - --host
-      - 0.0.0.0
-      - --port
-      - "8080"
+      - sh
+      - -c
+      - >-
+        if [ "${APP_TLS_ENABLED:-false}" = "true" ] &&
+           [ -n "${APP_TLS_CERTFILE:-}" ] && [ -n "${APP_TLS_KEYFILE:-}" ] &&
+           [ -f "${APP_TLS_CERTFILE}" ] && [ -f "${APP_TLS_KEYFILE}" ]; then
+          echo "Starting AstroLlama app with TLS: ${APP_TLS_CERTFILE}";
+          exec python -m uvicorn app.main:app --host 0.0.0.0 --port 8080 --ssl-certfile "${APP_TLS_CERTFILE}" --ssl-keyfile "${APP_TLS_KEYFILE}";
+        else
+          echo "Starting AstroLlama app without TLS";
+          exec python -m uvicorn app.main:app --host 0.0.0.0 --port 8080;
+        fi
     depends_on:
       - llama
       - mcp
@@ -75,6 +79,9 @@ services:
       MCP_SERVER_URL: http://mcp:8000/mcp/
       APP_HOST: 0.0.0.0
       APP_PORT: 8080
+      APP_TLS_ENABLED: ${APP_TLS_ENABLED:-false}
+      APP_TLS_CERTFILE: ${APP_TLS_CERTFILE:-}
+      APP_TLS_KEYFILE: ${APP_TLS_KEYFILE:-}
     volumes:
       - ./app:/app/app
       - ./common:/app/common
@@ -82,5 +89,6 @@ services:
       - ./data:/app/data
       - ./logs:/app/logs
       - ./logs:/app/logs
+      - ./certs:/certs:ro
       - ./mcp_server:/app/mcp_server
       - ./scripts:/app/scripts

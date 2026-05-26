@@ -71,6 +71,17 @@ _AAVSO_FINDER_INTENT_RE = re.compile(
     re.IGNORECASE,
 )
 
+_ALPACA_CAPTURE_TARGET_PATTERNS = [
+    re.compile(
+        r"\b(?:move|slew|point)(?:\s+the\s+telescope)?\s+to\s+(.+?)(?:\s+(?:and|then)\s+|[,.!?]|$)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:take|capture|image)\s+(?:an?\s+|\d+\s+)?(?:\d+(?:\.\d+)?\s*(?:second|seconds|sec|s)\s+)?(?:images?|exposures?|frames?)\s+(?:of|for)\s+(.+?)(?:\s+(?:and|then)\s+|[,.!?]|$)",
+        re.IGNORECASE,
+    ),
+]
+
 
 def _extract_location_for_latlong_query(text: str) -> str | None:
     """Best-effort extraction of location text from a lat/long user query."""
@@ -127,6 +138,57 @@ def _extract_aavso_star_query(text: str) -> str | None:
             return candidate
 
     return None
+
+
+def _extract_alpaca_capture_request(text: str) -> dict[str, Any] | None:
+    """Best-effort extraction for explicit telescope slew/capture commands."""
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+
+    lowered = raw.lower()
+    if not any(term in lowered for term in ["exposure", "capture", "image", "slew", "telescope", "point"]):
+        return None
+
+    exposure_match = re.search(
+        r"\b(\d+(?:\.\d+)?)\s*(?:second|seconds|sec|s)\b",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if not exposure_match:
+        return None
+
+    target: str | None = None
+    for pattern in _ALPACA_CAPTURE_TARGET_PATTERNS:
+        match = pattern.search(raw)
+        if match:
+            candidate = match.group(1).strip(" ?.!,:;")
+            if candidate:
+                target = candidate
+                break
+
+    if not target:
+        return None
+
+    exposure_count = 1
+    count_patterns = [
+        r"\b(?:take|capture|image)\s+(\d+)\s+\d+(?:\.\d+)?\s*(?:second|seconds|sec|s)\s+(?:images?|exposures?|frames?)\b",
+        r"\b(\d+)\s*[x×]\s*\d+(?:\.\d+)?\s*(?:second|seconds|sec|s)\s+(?:images?|exposures?|frames?)\b",
+    ]
+    for pattern in count_patterns:
+        match = re.search(pattern, raw, flags=re.IGNORECASE)
+        if match:
+            exposure_count = int(match.group(1))
+            break
+
+    light_frame = not bool(re.search(r"\bdark\s+frame\b", raw, flags=re.IGNORECASE))
+
+    return {
+        "object_name": target,
+        "exposure_seconds": float(exposure_match.group(1)),
+        "exposure_count": exposure_count,
+        "light_frame": light_frame,
+    }
 
 
 def _find_tool_name(tools: list[dict[str, Any]], candidates: list[str]) -> str | None:
@@ -385,6 +447,62 @@ def _serialize_tool_result(content: Any) -> str:
     return _content_item_to_str(content)
 
 
+def _alpaca_capture_start_user_message(args: dict[str, Any]) -> str:
+    target = str(args.get("object_name") or "the target").strip() or "the target"
+    exposure_seconds = args.get("exposure_seconds")
+    exposure_count = int(args.get("exposure_count") or 1)
+
+    try:
+        exposure_value = float(exposure_seconds)
+        exposure_text = str(int(exposure_value)) if exposure_value.is_integer() else str(exposure_value)
+    except Exception:
+        exposure_text = "requested"
+
+    if exposure_text == "requested":
+        capture_text = "A capture job has been started."
+    elif exposure_count > 1:
+        capture_text = f"A capture job for {exposure_count} x {exposure_text}-second exposures has been started."
+    else:
+        capture_text = f"A {exposure_text}-second exposure has been started."
+
+    if target != "the target":
+        capture_text = capture_text[:-1] + f" on {target}."
+
+    return capture_text + " Ask for the capture status when you want an update."
+
+
+def _append_hidden_tool_exchange(
+    history: list[dict[str, Any]],
+    tool_name: str,
+    args: dict[str, Any],
+    result_str: str,
+) -> None:
+    tool_call_id = f"hidden_{uuid.uuid4().hex[:8]}"
+    history.append(
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": tool_call_id,
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": json.dumps(args),
+                    },
+                }
+            ],
+        }
+    )
+    history.append(
+        {
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "content": result_str,
+        }
+    )
+
+
 def _prepare_llm_tool_content(tool_name: str, result: str) -> str:
     """Return tool content plus tool-specific reply-format instructions for the LLM."""
     if tool_name == "search_papers" and "[" in result and "](" in result:
@@ -517,6 +635,35 @@ async def run_chat(
         except Exception as exc:
             logger.warning("AAVSO fast-path failed, falling back to normal flow: %s", exc)
 
+    # Deterministic fast-path for explicit Alpaca slew/capture requests.
+    alpaca_capture_args = _extract_alpaca_capture_request(last_user_text)
+    alpaca_capture_tool = _find_tool_name(
+        tools,
+        ["alpaca_slew_and_capture", "alpaca_slew_and_capture_start"],
+    )
+    if alpaca_capture_args and alpaca_capture_tool:
+        if emit_tool_events:
+            yield {"type": "tool_start", "name": alpaca_capture_tool, "args": alpaca_capture_args}
+        logger.info(
+            "Alpaca capture fast-path tool call -> %s  args=%s",
+            alpaca_capture_tool,
+            json.dumps(alpaca_capture_args, ensure_ascii=False),
+        )
+        try:
+            raw_result = await mcp_client.call_tool(alpaca_capture_tool, alpaca_capture_args)
+            result_str = _serialize_tool_result(raw_result)
+            _append_hidden_tool_exchange(history, alpaca_capture_tool, alpaca_capture_args, result_str)
+            user_text = _alpaca_capture_start_user_message(alpaca_capture_args)
+            if emit_tool_events:
+                yield {"type": "tool_result", "name": alpaca_capture_tool, "result": user_text}
+            yield {"type": "token", "text": user_text}
+            yield {"type": "done"}
+            return
+        except Exception as exc:
+            logger.warning("Alpaca capture fast-path failed, falling back to normal flow: %s", exc)
+            if emit_tool_events:
+                yield {"type": "tool_error", "name": alpaca_capture_tool, "error": str(exc)}
+
     # --- RAG: build a one-shot messages list with context appended to the
     #     system prompt. We never mutate the stored history. ----------------
     llm_messages = list(history)  # shallow copy — safe to modify positions
@@ -524,12 +671,18 @@ async def run_chat(
     # When tools are active, remind the model how to route tool calls correctly.
     if tools and llm_messages and llm_messages[0].get("role") == "system":
         tool_names = [t["function"]["name"] for t in tools]
-        simbad_hint = (
+        tool_policy = (
             "\n\nTOOL USE POLICY (follow strictly):\n"
             "1. Answer from your own training knowledge. If you know the answer, say it directly.\n"
             "2. If RAG context was injected above, use it to supplement your answer.\n"
             "3. Do NOT call any tool simply because the topic is astronomical or because you are uncertain.\n"
-            "4. Only call a tool when the user has EXPLICITLY requested that specific action:\n"
+            "4. Never call orchestrate for a single direct action that one tool can execute immediately.\n"
+            "   - Example: 'Move the telescope to M45 and take a 10 second exposure' should call alpaca_slew_and_capture directly.\n"
+            "   - Use orchestrate only for true multi-step planning, explicit workflow design, or when critical information is missing and safe execution is impossible.\n"
+            "5. Prefer the most specific execution tool over a planning tool.\n"
+            "   - For telescope imaging requests with a clear target and exposure, call the Alpaca imaging tool directly.\n"
+            "   - For discovery/setup questions, use Alpaca discovery or diagnostics tools directly.\n"
+            "6. Only call a tool when the user has EXPLICITLY requested that specific action:\n"
             "   - simbad_lookup_object: use for ONE specific object (e.g. coordinates/properties of NGC 1015).\n"
             "   - simbad_search: use for multi-result list/browse queries (e.g. 'brightest stars', 'galaxies in Orion').\n"
             "     Never call either SIMBAD tool to answer general astronomy questions, explain concepts, or as a fallback.\n"
@@ -543,16 +696,15 @@ async def run_chat(
             "   - generate_constellation_map / generate_map: ONLY if the user asks to SEE or SHOW a chart or map.\n"
             "   - get_weather / get_latlong: ONLY for explicit weather or location queries.\n"
             "   - get_current_time: ONLY when the user asks what time it is.\n"
-            "5. If you do not know something, say so plainly. Do NOT call a tool as a substitute for not knowing.\n"
-            "6. Do NOT call any tool more than once for the same question. In particular:\n"
+            "7. If you do not know something, say so plainly. Do NOT call a tool as a substitute for not knowing.\n"
+            "8. Do NOT call any tool more than once for the same question. In particular:\n"
             "   - After load_paper_html_text returns content, summarize it directly (no follow-up tools).\n"
             "   - After simbad tools return results, answer directly (no follow-up data lookups).\n"
-        ) if "simbad_search" in tool_names else ""
-        if simbad_hint:
-            llm_messages[0] = {
-                **llm_messages[0],
-                "content": llm_messages[0]["content"] + simbad_hint,
-            }
+        )
+        llm_messages[0] = {
+            **llm_messages[0],
+            "content": llm_messages[0]["content"] + tool_policy,
+        }
 
     # Help the model recover likely speech-to-text mistakes using nearby context.
     if llm_messages and llm_messages[0].get("role") == "system":

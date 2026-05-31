@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
+import shlex
+import shutil
+import subprocess
 import threading
 import time
 import traceback
@@ -21,6 +25,14 @@ class Tools:
     _CATALOG_COMMON_NAMES = {
         "M45": "Pleiades",
     }
+    _DEFAULT_ASTAP_BINARY_CANDIDATES = (
+        "/opt/astap/astap",
+        "/opt/astap/astap_cli",
+        "/usr/local/bin/astap",
+        "/usr/local/bin/astap_cli",
+        "astap",
+        "astap_cli",
+    )
     _JOB_LOCK = threading.Lock()
     _JOBS: dict[str, dict[str, object]] = {}
 
@@ -74,6 +86,22 @@ class Tools:
             ge=0.1,
             le=30.0,
             description="Polling interval while waiting for image readiness.",
+        )
+        plate_solve_exposure_seconds: float = Field(
+            default=2.0,
+            gt=0,
+            le=120.0,
+            description="Exposure length in seconds for slew+plate-solve verification frames.",
+        )
+        astap_binary_path: str = Field(
+            default="/opt/astap/astap",
+            description="Path to ASTAP executable for plate solving.",
+        )
+        astap_timeout_seconds: int = Field(
+            default=180,
+            ge=5,
+            le=3600,
+            description="Maximum time to wait for ASTAP solve command completion.",
         )
 
     def __init__(self, valves: "Tools.Valves | None" = None) -> None:
@@ -288,6 +316,76 @@ class Tools:
         """
         return await asyncio.to_thread(self._unpark_telescope_sync, protocol)
 
+    async def alpaca_slew_and_plate_solve(
+        self,
+        object_name: str | None = None,
+        ra_hours: float | None = None,
+        dec_degrees: float | None = None,
+        protocol: Literal["http", "https"] | None = None,
+        plate_solve_exposure_seconds: float | None = None,
+        file_stem: str | None = None,
+        bin_x: int = 1,
+        bin_y: int = 1,
+        enable_tracking: bool = True,
+    ) -> str:
+        """Slew the telescope to a target and plate-solve a short verification frame.
+
+        This is a pre-imaging alignment verification step. It does not run the
+        multi-exposure imaging workflow.
+
+        :param object_name: Optional object identifier (for example "M45").
+        :param ra_hours: Right ascension in hours when targeting by coordinates.
+        :param dec_degrees: Declination in degrees when targeting by coordinates.
+        :param protocol: Alpaca protocol, usually "http".
+        :param plate_solve_exposure_seconds: Exposure length for verification frame.
+        :param file_stem: Optional output FITS filename stem.
+        :param bin_x: Camera X binning value.
+        :param bin_y: Camera Y binning value.
+        :param enable_tracking: If True, attempt to enable tracking before slewing.
+        :returns: Plate-solve summary with solve status and saved file path.
+        """
+        return await asyncio.to_thread(
+            self._run_slew_and_plate_solve,
+            object_name,
+            ra_hours,
+            dec_degrees,
+            protocol,
+            plate_solve_exposure_seconds,
+            file_stem,
+            bin_x,
+            bin_y,
+            enable_tracking,
+        )
+
+    async def alpaca_plate_solve_current_position(
+        self,
+        protocol: Literal["http", "https"] | None = None,
+        plate_solve_exposure_seconds: float | None = None,
+        file_stem: str | None = None,
+        bin_x: int = 1,
+        bin_y: int = 1,
+    ) -> str:
+        """Plate-solve at the telescope's current pointing without slewing.
+
+        This captures a short verification frame at the current telescope
+        location and runs ASTAP plate solving. Imaging remains a separate step.
+
+        :param protocol: Alpaca protocol, usually "http".
+        :param plate_solve_exposure_seconds: Exposure length for verification frame.
+        :param file_stem: Optional output FITS filename stem.
+        :param bin_x: Camera X binning value.
+        :param bin_y: Camera Y binning value.
+        :returns: Plate-solve summary including telescope current coordinates.
+        """
+        return await asyncio.to_thread(
+            self._run_plate_solve_current_position,
+            protocol,
+            plate_solve_exposure_seconds,
+            file_stem,
+            bin_x,
+            bin_y,
+        )
+
     def _park_telescope_sync(
         self,
         protocol: Literal["http", "https"] | None,
@@ -481,12 +579,21 @@ class Tools:
                     # Some mounts may not support toggling Tracking; proceed and let slew fail if needed.
                     pass
 
-            self._start_slew(telescope=telescope, ra_hours=target_ra, dec_degrees=target_dec)
-            self._wait_for_slew_completion(
-                telescope=telescope,
-                target_ra_hours=target_ra,
-                target_dec_degrees=target_dec,
-            )
+            try:
+                self._start_slew(telescope=telescope, ra_hours=target_ra, dec_degrees=target_dec)
+                self._wait_for_slew_completion(
+                    telescope=telescope,
+                    target_ra_hours=target_ra,
+                    target_dec_degrees=target_dec,
+                )
+            except Exception as exc:
+                diagnostics = self._format_telescope_motion_diagnostics(telescope)
+                raise RuntimeError(
+                    "Telescope slew failed before capture. "
+                    f"Diagnostics: {diagnostics}. "
+                    "Check that the mount is unparked, aligned/homed, and accepts remote slew commands. "
+                    f"Original error: {exc}"
+                ) from exc
 
             self._configure_camera(camera=camera, bin_x=bin_x, bin_y=bin_y)
             timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -528,6 +635,258 @@ class Tools:
                 f"Exposures captured: {int(exposure_count)} x {effective_exposure_seconds}s (light_frame={light_frame})\n"
                 "Saved FITS files:\n"
                 + "\n".join(self._files_api_markdown_link(path) for path in output_paths)
+            )
+        finally:
+            try:
+                camera.Connected = False
+            except Exception:
+                pass
+            try:
+                telescope.Connected = False
+            except Exception:
+                pass
+
+    def _run_slew_and_plate_solve(
+        self,
+        object_name: str | None,
+        ra_hours: float | None,
+        dec_degrees: float | None,
+        protocol: Literal["http", "https"] | None,
+        plate_solve_exposure_seconds: float | None,
+        file_stem: str | None,
+        bin_x: int,
+        bin_y: int,
+        enable_tracking: bool,
+    ) -> str:
+        effective_exposure_seconds = (
+            float(plate_solve_exposure_seconds)
+            if plate_solve_exposure_seconds is not None
+            else float(self.valves.plate_solve_exposure_seconds)
+        )
+
+        if effective_exposure_seconds <= 0:
+            raise ValueError("plate_solve_exposure_seconds must be > 0")
+        if bin_x < 1 or bin_y < 1:
+            raise ValueError("bin_x and bin_y must be >= 1")
+
+        target_ra, target_dec, target_label = self._resolve_target(
+            object_name=object_name,
+            ra_hours=ra_hours,
+            dec_degrees=dec_degrees,
+        )
+
+        endpoint = self.valves.default_alpaca_address.strip()
+        if not endpoint:
+            raise ValueError("alpaca_address cannot be empty")
+
+        effective_telescope_device_number = int(self.valves.default_telescope_device_number)
+        effective_camera_device_number = int(self.valves.default_camera_device_number)
+        effective_protocol = protocol or self.valves.default_protocol
+
+        try:
+            from alpaca.camera import Camera
+            from alpaca.telescope import Telescope
+        except Exception as exc:
+            raise RuntimeError(
+                "Alpaca client library is unavailable. Install it with: pip install alpyca"
+            ) from exc
+
+        telescope = Telescope(endpoint, effective_telescope_device_number, protocol=effective_protocol)
+        camera = Camera(endpoint, effective_camera_device_number, protocol=effective_protocol)
+
+        started_at = datetime.now(timezone.utc)
+        try:
+            telescope.Connected = True
+            camera.Connected = True
+
+            self._ensure_device_connected(telescope, "telescope")
+            self._ensure_device_connected(camera, "camera")
+
+            self._ensure_telescope_ready_for_motion(telescope)
+
+            if enable_tracking:
+                try:
+                    telescope.Tracking = True
+                except Exception:
+                    pass
+
+            try:
+                self._start_slew(telescope=telescope, ra_hours=target_ra, dec_degrees=target_dec)
+                self._wait_for_slew_completion(
+                    telescope=telescope,
+                    target_ra_hours=target_ra,
+                    target_dec_degrees=target_dec,
+                )
+            except Exception as exc:
+                diagnostics = self._format_telescope_motion_diagnostics(telescope)
+                raise RuntimeError(
+                    "Telescope slew failed before plate solve. "
+                    f"Diagnostics: {diagnostics}. "
+                    "Check that the mount is unparked, aligned/homed, and accepts remote slew commands. "
+                    f"Original error: {exc}"
+                ) from exc
+
+            self._configure_camera(camera=camera, bin_x=bin_x, bin_y=bin_y)
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            stem = file_stem or f"alpaca_platesolve_{self._sanitize_for_filename(target_label)}_{timestamp}"
+
+            camera.StartExposure(float(effective_exposure_seconds), True)
+            self._wait_for_image_ready(camera=camera)
+
+            out_path = self._save_fits(
+                image_data=camera.ImageArray,
+                image_info=camera.ImageArrayInfo,
+                camera=camera,
+                file_stem=stem,
+                object_name=object_name,
+                ra_hours=target_ra,
+                dec_degrees=target_dec,
+                exposure_seconds=effective_exposure_seconds,
+                exposure_actual=self._safe_getattr(camera, "LastExposureDuration"),
+                exposure_start=self._safe_getattr(camera, "LastExposureStartTime"),
+                started_at=started_at,
+            )
+
+            binary = self._resolve_astap_binary()
+            if not binary:
+                raise RuntimeError(
+                    "ASTAP executable not found. Install ASTAP in the container or set astap_binary_path/ASTAP_BINARY_PATH."
+                )
+
+            cmd = [binary, "-f", str(out_path.resolve()), "-update", "-wcs"]
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=int(self.valves.astap_timeout_seconds),
+                check=False,
+            )
+            combined = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+            solved = self._astap_looks_solved(combined, proc.returncode)
+            solved_ra_hours, solved_dec_degrees = self._extract_astap_solved_coordinates(combined)
+
+            return (
+                f"Alpaca slew and plate solve completed for {target_label}.\n"
+                f"Requested coordinates: RA={target_ra:.6f}h, DEC={target_dec:.6f}deg\n"
+                f"Verification frame: {self._files_api_markdown_link(out_path)}\n"
+                f"Plate solved: {solved}\n"
+                f"Solved RA (hours): {solved_ra_hours}\n"
+                f"Solved DEC (degrees): {solved_dec_degrees}\n"
+                f"ASTAP command: {' '.join(shlex.quote(part) for part in cmd)}\n"
+                f"ASTAP return code: {proc.returncode}"
+            )
+        finally:
+            try:
+                camera.Connected = False
+            except Exception:
+                pass
+            try:
+                telescope.Connected = False
+            except Exception:
+                pass
+
+    def _run_plate_solve_current_position(
+        self,
+        protocol: Literal["http", "https"] | None,
+        plate_solve_exposure_seconds: float | None,
+        file_stem: str | None,
+        bin_x: int,
+        bin_y: int,
+    ) -> str:
+        effective_exposure_seconds = (
+            float(plate_solve_exposure_seconds)
+            if plate_solve_exposure_seconds is not None
+            else float(self.valves.plate_solve_exposure_seconds)
+        )
+
+        if effective_exposure_seconds <= 0:
+            raise ValueError("plate_solve_exposure_seconds must be > 0")
+        if bin_x < 1 or bin_y < 1:
+            raise ValueError("bin_x and bin_y must be >= 1")
+
+        endpoint = self.valves.default_alpaca_address.strip()
+        if not endpoint:
+            raise ValueError("alpaca_address cannot be empty")
+
+        effective_telescope_device_number = int(self.valves.default_telescope_device_number)
+        effective_camera_device_number = int(self.valves.default_camera_device_number)
+        effective_protocol = protocol or self.valves.default_protocol
+
+        try:
+            from alpaca.camera import Camera
+            from alpaca.telescope import Telescope
+        except Exception as exc:
+            raise RuntimeError(
+                "Alpaca client library is unavailable. Install it with: pip install alpyca"
+            ) from exc
+
+        telescope = Telescope(endpoint, effective_telescope_device_number, protocol=effective_protocol)
+        camera = Camera(endpoint, effective_camera_device_number, protocol=effective_protocol)
+
+        started_at = datetime.now(timezone.utc)
+        try:
+            telescope.Connected = True
+            camera.Connected = True
+
+            self._ensure_device_connected(telescope, "telescope")
+            self._ensure_device_connected(camera, "camera")
+
+            current_ra = self._safe_getattr(telescope, "RightAscension")
+            current_dec = self._safe_getattr(telescope, "Declination")
+            try:
+                current_ra_hours = float(current_ra)
+                current_dec_degrees = float(current_dec)
+            except Exception as exc:
+                raise RuntimeError("Unable to read current telescope coordinates for plate solving") from exc
+
+            self._configure_camera(camera=camera, bin_x=bin_x, bin_y=bin_y)
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            stem = file_stem or f"alpaca_current_platesolve_{timestamp}"
+
+            camera.StartExposure(float(effective_exposure_seconds), True)
+            self._wait_for_image_ready(camera=camera)
+
+            out_path = self._save_fits(
+                image_data=camera.ImageArray,
+                image_info=camera.ImageArrayInfo,
+                camera=camera,
+                file_stem=stem,
+                object_name="current_pointing",
+                ra_hours=current_ra_hours,
+                dec_degrees=current_dec_degrees,
+                exposure_seconds=effective_exposure_seconds,
+                exposure_actual=self._safe_getattr(camera, "LastExposureDuration"),
+                exposure_start=self._safe_getattr(camera, "LastExposureStartTime"),
+                started_at=started_at,
+            )
+
+            binary = self._resolve_astap_binary()
+            if not binary:
+                raise RuntimeError(
+                    "ASTAP executable not found. Install ASTAP in the container or set astap_binary_path/ASTAP_BINARY_PATH."
+                )
+
+            cmd = [binary, "-f", str(out_path.resolve()), "-update", "-wcs"]
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=int(self.valves.astap_timeout_seconds),
+                check=False,
+            )
+            combined = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+            solved = self._astap_looks_solved(combined, proc.returncode)
+            solved_ra_hours, solved_dec_degrees = self._extract_astap_solved_coordinates(combined)
+
+            return (
+                "Alpaca plate solve at current location completed.\n"
+                f"Telescope current coordinates: RA={current_ra_hours:.6f}h, DEC={current_dec_degrees:.6f}deg\n"
+                f"Verification frame: {self._files_api_markdown_link(out_path)}\n"
+                f"Plate solved: {solved}\n"
+                f"Solved RA (hours): {solved_ra_hours}\n"
+                f"Solved DEC (degrees): {solved_dec_degrees}\n"
+                f"ASTAP command: {' '.join(shlex.quote(part) for part in cmd)}\n"
+                f"ASTAP return code: {proc.returncode}"
             )
         finally:
             try:
@@ -633,12 +992,50 @@ class Tools:
 
     def _start_slew(self, telescope, ra_hours: float, dec_degrees: float) -> None:
         can_slew_async = bool(self._safe_getattr(telescope, "CanSlewAsync", default=True))
+        can_slew_sync = bool(self._safe_getattr(telescope, "CanSlew", default=True))
+        async_error: Exception | None = None
+
+        if not can_slew_async and not can_slew_sync:
+            raise RuntimeError("Configured telescope reports CanSlew=False and CanSlewAsync=False")
+
         if can_slew_async and hasattr(telescope, "SlewToCoordinatesAsync"):
-            telescope.SlewToCoordinatesAsync(ra_hours, dec_degrees)
-            if self._wait_for_slew_start(telescope, timeout_seconds=5.0):
+            try:
+                telescope.SlewToCoordinatesAsync(ra_hours, dec_degrees)
+                # If async call succeeds, stay on async path. Some Alpaca mounts
+                # report Slewing=False even while a move is in progress and reject
+                # synchronous methods entirely.
                 return
-            # Some drivers report CanSlewAsync=True but never begin motion; fall back.
+            except Exception as exc:
+                # Some mounts reject async slews (for example 0x4ff) but accept sync slews.
+                async_error = exc
+
+        if not can_slew_sync:
+            if async_error is not None:
+                raise RuntimeError(
+                    "Configured telescope reports CanSlew=False and async slew failed: "
+                    f"{async_error}"
+                ) from async_error
+            raise RuntimeError("Configured telescope reports CanSlew=False")
+
         telescope.SlewToCoordinates(ra_hours, dec_degrees)
+
+    def _format_telescope_motion_diagnostics(self, telescope) -> str:
+        fields = [
+            "Connected",
+            "AtPark",
+            "CanUnpark",
+            "CanSlew",
+            "CanSlewAsync",
+            "Tracking",
+            "Slewing",
+            "RightAscension",
+            "Declination",
+        ]
+        parts: list[str] = []
+        for field in fields:
+            value = self._safe_getattr(telescope, field, default="unknown")
+            parts.append(f"{field}={value}")
+        return ", ".join(parts)
 
     def _wait_for_slew_completion(
         self,
@@ -648,17 +1045,19 @@ class Tools:
     ) -> None:
         deadline = time.monotonic() + float(self.valves.slew_timeout_seconds)
         poll = float(self.valves.slew_poll_seconds)
+        use_target_convergence = target_ra_hours is not None and target_dec_degrees is not None
+
         while time.monotonic() < deadline:
+            if use_target_convergence and self._telescope_at_target(telescope, target_ra_hours, target_dec_degrees):
+                return
+
             try:
-                if not bool(telescope.Slewing):
+                slewing = bool(telescope.Slewing)
+                if not slewing and not use_target_convergence:
                     return
             except Exception:
-                # Some drivers don't expose reliable Slewing; use coordinate convergence.
-                if (
-                    target_ra_hours is not None
-                    and target_dec_degrees is not None
-                    and self._telescope_at_target(telescope, target_ra_hours, target_dec_degrees)
-                ):
+                # Some drivers don't expose reliable Slewing.
+                if use_target_convergence and self._telescope_at_target(telescope, target_ra_hours, target_dec_degrees):
                     return
             time.sleep(poll)
         raise TimeoutError("Timed out waiting for telescope slew to complete")
@@ -739,6 +1138,57 @@ class Tools:
             return
         if not bool(state):
             raise RuntimeError(f"Configured Alpaca {device_label} is not connected")
+
+    def _resolve_astap_binary(self) -> str | None:
+        candidates: list[str] = []
+        configured = str(getattr(self.valves, "astap_binary_path", "") or "").strip()
+        if configured:
+            candidates.append(configured)
+
+        env_override = str(os.environ.get("ASTAP_BINARY_PATH", "") or "").strip()
+        if env_override:
+            candidates.append(env_override)
+
+        candidates.extend(self._DEFAULT_ASTAP_BINARY_CANDIDATES)
+
+        seen: set[str] = set()
+        for candidate in candidates:
+            candidate = candidate.strip()
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+
+            candidate_path = Path(candidate)
+            if candidate_path.is_absolute() or candidate_path.parent != Path("."):
+                if candidate_path.exists() and os.access(candidate_path, os.X_OK):
+                    return str(candidate_path)
+                continue
+
+            resolved = shutil.which(candidate)
+            if resolved:
+                return resolved
+
+        return None
+
+    @staticmethod
+    def _astap_looks_solved(output_text: str, return_code: int) -> bool:
+        text = str(output_text or "").lower()
+        if "no solution" in text or "failed" in text:
+            return False
+        if "solution" in text or "solved" in text or "wcs" in text:
+            return True
+        return return_code == 0
+
+    @staticmethod
+    def _extract_astap_solved_coordinates(output_text: str) -> tuple[float | None, float | None]:
+        text = str(output_text or "")
+
+        ra_match = re.search(r"\bRA\s*[:=]\s*([0-9]{1,2}(?:\.[0-9]+)?)", text, flags=re.IGNORECASE)
+        dec_match = re.search(r"\bDEC\s*[:=]\s*([+-]?[0-9]{1,2}(?:\.[0-9]+)?)", text, flags=re.IGNORECASE)
+
+        ra_val = float(ra_match.group(1)) if ra_match else None
+        dec_val = float(dec_match.group(1)) if dec_match else None
+        return ra_val, dec_val
 
     def _configure_camera(self, camera, bin_x: int, bin_y: int) -> None:
         camera.BinX = int(bin_x)

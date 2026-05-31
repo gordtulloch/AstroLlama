@@ -36,7 +36,6 @@ if ($Renew) {
         "--manual",
         "--preferred-challenges", "dns",
         "--agree-tos",
-        "--manual-public-ip-logging-ok",
         "--email", $Email,
         "--domain", $Domain,
         "--key-type", "rsa",

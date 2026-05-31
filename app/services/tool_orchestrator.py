@@ -83,6 +83,74 @@ _ALPACA_CAPTURE_TARGET_PATTERNS = [
 ]
 
 
+def _extract_alpaca_slew_plate_solve_request(text: str) -> dict[str, Any] | None:
+    """Best-effort extraction for explicit telescope slew + plate-solve commands."""
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+
+    lowered = raw.lower()
+    if not any(term in lowered for term in ["platesolve", "plate solve", "plate-solve"]):
+        return None
+    if not any(term in lowered for term in ["slew", "move", "point", "telescope"]):
+        return None
+
+    target: str | None = None
+    for pattern in _ALPACA_CAPTURE_TARGET_PATTERNS:
+        match = pattern.search(raw)
+        if match:
+            candidate = match.group(1).strip(" ?.!,:;")
+            if candidate:
+                target = candidate
+                break
+
+    if not target:
+        return None
+
+    args: dict[str, Any] = {"object_name": target}
+    exposure_match = re.search(
+        r"\b(\d+(?:\.\d+)?)\s*(?:second|seconds|sec|s)\b",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if exposure_match:
+        args["plate_solve_exposure_seconds"] = float(exposure_match.group(1))
+
+    return args
+
+
+def _extract_alpaca_current_plate_solve_request(text: str) -> dict[str, Any] | None:
+    """Best-effort extraction for explicit plate-solve-at-current-pointing commands."""
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+
+    lowered = raw.lower()
+    has_plate_solve_term = any(term in lowered for term in ["platesolve", "plate solve", "plate-solve"])
+    has_current_pointing_term = any(
+        term in lowered
+        for term in ["current", "current location", "current position", "current pointing", "where i am", "here"]
+    )
+    has_verify_current_term = (
+        any(term in lowered for term in ["verify", "check", "confirm"])
+        and any(term in lowered for term in ["current pointing", "current position", "current location", "where i am", "here"])
+    )
+
+    if not ((has_plate_solve_term and has_current_pointing_term) or has_verify_current_term):
+        return None
+
+    args: dict[str, Any] = {}
+    exposure_match = re.search(
+        r"\b(\d+(?:\.\d+)?)\s*(?:second|seconds|sec|s)\b",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if exposure_match:
+        args["plate_solve_exposure_seconds"] = float(exposure_match.group(1))
+
+    return args
+
+
 def _extract_location_for_latlong_query(text: str) -> str | None:
     """Best-effort extraction of location text from a lat/long user query."""
     raw = str(text or "").strip()
@@ -580,6 +648,21 @@ async def run_chat(
                 len(tools),
                 [t["function"]["name"] for t in tools] or "(none)")
 
+    async def _refresh_tools_from_mcp(reason: str) -> None:
+        nonlocal tools
+        if not mcp_client.available:
+            return
+        try:
+            await mcp_client.reconnect()
+            tools = mcp_client.tools if mcp_client.available else []
+            logger.info(
+                "Refreshed MCP tools for %s: %d tool(s)",
+                reason,
+                len(tools),
+            )
+        except Exception as exc:
+            logger.warning("Failed to refresh MCP tools for %s: %s", reason, exc)
+
     # Deterministic fast-path for explicit coordinate questions.
     last_user_text = ""
     for msg in reversed(history):
@@ -636,6 +719,74 @@ async def run_chat(
             logger.warning("AAVSO fast-path failed, falling back to normal flow: %s", exc)
 
     # Deterministic fast-path for explicit Alpaca slew/capture requests.
+    alpaca_current_solve_args = _extract_alpaca_current_plate_solve_request(last_user_text)
+    alpaca_current_solve_tool = _find_tool_name(
+        tools,
+        ["alpaca_plate_solve_current_position"],
+    )
+    if alpaca_current_solve_args is not None and not alpaca_current_solve_tool:
+        await _refresh_tools_from_mcp("alpaca current plate-solve fast-path")
+        alpaca_current_solve_tool = _find_tool_name(
+            tools,
+            ["alpaca_plate_solve_current_position"],
+        )
+    if alpaca_current_solve_args is not None and alpaca_current_solve_tool:
+        if emit_tool_events:
+            yield {"type": "tool_start", "name": alpaca_current_solve_tool, "args": alpaca_current_solve_args}
+        logger.info(
+            "Alpaca current plate-solve fast-path tool call -> %s  args=%s",
+            alpaca_current_solve_tool,
+            json.dumps(alpaca_current_solve_args, ensure_ascii=False),
+        )
+        try:
+            raw_result = await mcp_client.call_tool(alpaca_current_solve_tool, alpaca_current_solve_args)
+            result_str = _serialize_tool_result(raw_result)
+            _append_hidden_tool_exchange(history, alpaca_current_solve_tool, alpaca_current_solve_args, result_str)
+            if emit_tool_events:
+                yield {"type": "tool_result", "name": alpaca_current_solve_tool, "result": result_str}
+            yield {"type": "token", "text": result_str}
+            yield {"type": "done"}
+            return
+        except Exception as exc:
+            logger.warning("Alpaca current plate-solve fast-path failed, falling back to normal flow: %s", exc)
+            if emit_tool_events:
+                yield {"type": "tool_error", "name": alpaca_current_solve_tool, "error": str(exc)}
+
+    # Deterministic fast-path for explicit Alpaca slew/capture requests.
+    alpaca_slew_solve_args = _extract_alpaca_slew_plate_solve_request(last_user_text)
+    alpaca_slew_solve_tool = _find_tool_name(
+        tools,
+        ["alpaca_slew_and_plate_solve"],
+    )
+    if alpaca_slew_solve_args and not alpaca_slew_solve_tool:
+        await _refresh_tools_from_mcp("alpaca slew+plate-solve fast-path")
+        alpaca_slew_solve_tool = _find_tool_name(
+            tools,
+            ["alpaca_slew_and_plate_solve"],
+        )
+    if alpaca_slew_solve_args and alpaca_slew_solve_tool:
+        if emit_tool_events:
+            yield {"type": "tool_start", "name": alpaca_slew_solve_tool, "args": alpaca_slew_solve_args}
+        logger.info(
+            "Alpaca slew+plate-solve fast-path tool call -> %s  args=%s",
+            alpaca_slew_solve_tool,
+            json.dumps(alpaca_slew_solve_args, ensure_ascii=False),
+        )
+        try:
+            raw_result = await mcp_client.call_tool(alpaca_slew_solve_tool, alpaca_slew_solve_args)
+            result_str = _serialize_tool_result(raw_result)
+            _append_hidden_tool_exchange(history, alpaca_slew_solve_tool, alpaca_slew_solve_args, result_str)
+            if emit_tool_events:
+                yield {"type": "tool_result", "name": alpaca_slew_solve_tool, "result": result_str}
+            yield {"type": "token", "text": result_str}
+            yield {"type": "done"}
+            return
+        except Exception as exc:
+            logger.warning("Alpaca slew+plate-solve fast-path failed, falling back to normal flow: %s", exc)
+            if emit_tool_events:
+                yield {"type": "tool_error", "name": alpaca_slew_solve_tool, "error": str(exc)}
+
+    # Deterministic fast-path for explicit Alpaca slew/capture requests.
     alpaca_capture_args = _extract_alpaca_capture_request(last_user_text)
     alpaca_capture_tool = _find_tool_name(
         tools,
@@ -678,6 +829,8 @@ async def run_chat(
             "3. Do NOT call any tool simply because the topic is astronomical or because you are uncertain.\n"
             "4. Never call orchestrate for a single direct action that one tool can execute immediately.\n"
             "   - Example: 'Move the telescope to M45 and take a 10 second exposure' should call alpaca_slew_and_capture directly.\n"
+            "   - Example: 'Slew to M45 and platesolve' should call alpaca_slew_and_plate_solve directly.\n"
+            "   - Example: 'Platesolve at current location and return current coordinates' should call alpaca_plate_solve_current_position directly.\n"
             "   - Use orchestrate only for true multi-step planning, explicit workflow design, or when critical information is missing and safe execution is impossible.\n"
             "5. Prefer the most specific execution tool over a planning tool.\n"
             "   - For telescope imaging requests with a clear target and exposure, call the Alpaca imaging tool directly.\n"

@@ -471,6 +471,42 @@ def test_start_slew_falls_back_to_sync_when_async_never_starts(monkeypatch):
     tool._start_slew(scope, ra_hours=3.0, dec_degrees=24.0)
 
     assert scope.async_calls == 1
+    assert scope.sync_calls == 0
+
+
+def test_start_slew_raises_when_mount_cannot_slew():
+    tool = Tools()
+
+    class FakeTelescope:
+        def __init__(self):
+            self.CanSlewAsync = False
+            self.CanSlew = False
+
+    with pytest.raises(RuntimeError, match="CanSlew=False and CanSlewAsync=False"):
+        tool._start_slew(FakeTelescope(), ra_hours=3.0, dec_degrees=24.0)
+
+
+def test_start_slew_falls_back_to_sync_when_async_raises_driver_error():
+    tool = Tools()
+
+    class FakeTelescope:
+        def __init__(self):
+            self.CanSlewAsync = True
+            self.CanSlew = True
+            self.async_calls = 0
+            self.sync_calls = 0
+
+        def SlewToCoordinatesAsync(self, _ra: float, _dec: float):
+            self.async_calls += 1
+            raise RuntimeError("SlewToCoordinatesAsync fail: fail to operate (Error Code: 0x4ff)")
+
+        def SlewToCoordinates(self, _ra: float, _dec: float):
+            self.sync_calls += 1
+
+    scope = FakeTelescope()
+    tool._start_slew(scope, ra_hours=3.0, dec_degrees=24.0)
+
+    assert scope.async_calls == 1
     assert scope.sync_calls == 1
 
 
@@ -493,6 +529,53 @@ def test_wait_for_slew_completion_uses_target_when_slewing_unavailable(monkeypat
         target_ra_hours=3.0,
         target_dec_degrees=24.0,
     )
+
+
+def test_wait_for_slew_completion_uses_target_when_slewing_false(monkeypatch):
+    tool = Tools()
+    tool.valves.slew_timeout_seconds = 1
+    tool.valves.slew_poll_seconds = 0.01
+
+    class FakeTelescope:
+        def __init__(self):
+            self._step = 0
+
+        @property
+        def Slewing(self):
+            return False
+
+        @property
+        def RightAscension(self):
+            # Converges toward target over multiple polls.
+            self._step += 1
+            return 2.8 if self._step < 3 else 3.0
+
+        @property
+        def Declination(self):
+            return 23.0 if self._step < 3 else 24.0
+
+    monkeypatch.setattr(time, "sleep", lambda _x: None)
+    tool._wait_for_slew_completion(
+        FakeTelescope(),
+        target_ra_hours=3.0,
+        target_dec_degrees=24.0,
+    )
+
+
+def test_resolve_astap_binary_prefers_valve_path(tmp_path):
+    tool = Tools()
+    binary = tmp_path / "astap"
+    binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    binary.chmod(0o755)
+
+    tool.valves.astap_binary_path = str(binary)
+
+    assert tool._resolve_astap_binary() == str(binary)
+
+
+def test_astap_looks_solved_from_output_text():
+    assert Tools._astap_looks_solved("Solution found", return_code=1) is True
+    assert Tools._astap_looks_solved("No solution", return_code=0) is False
 
 
 def test_run_slew_and_capture_raises_when_telescope_not_connected(monkeypatch):
@@ -545,3 +628,65 @@ def test_run_slew_and_capture_raises_when_telescope_not_connected(monkeypatch):
             bin_y=1,
             enable_tracking=True,
         )
+
+
+def test_run_slew_and_plate_solve_wraps_slew_failure_with_diagnostics(monkeypatch):
+    tool = Tools()
+
+    class FakeTelescope:
+        def __init__(self, endpoint: str, device_number: int, protocol: str = "http"):
+            self._connected = False
+            self.AtPark = False
+            self.CanUnpark = True
+            self.CanSlew = True
+            self.CanSlewAsync = True
+            self.Tracking = True
+            self.Slewing = False
+            self.RightAscension = 1.0
+            self.Declination = 2.0
+
+        @property
+        def Connected(self):
+            return self._connected
+
+        @Connected.setter
+        def Connected(self, value):
+            self._connected = bool(value)
+
+    class FakeCamera:
+        def __init__(self, endpoint: str, device_number: int, protocol: str = "http"):
+            self._connected = False
+
+        @property
+        def Connected(self):
+            return self._connected
+
+        @Connected.setter
+        def Connected(self, value):
+            self._connected = bool(value)
+
+    fake_telescope_mod = types.ModuleType("alpaca.telescope")
+    fake_telescope_mod.Telescope = FakeTelescope
+    fake_camera_mod = types.ModuleType("alpaca.camera")
+    fake_camera_mod.Camera = FakeCamera
+    monkeypatch.setitem(sys.modules, "alpaca.telescope", fake_telescope_mod)
+    monkeypatch.setitem(sys.modules, "alpaca.camera", fake_camera_mod)
+    monkeypatch.setattr(tool, "_resolve_target", lambda **_kwargs: (3.0, 24.0, "M45"))
+    monkeypatch.setattr(tool, "_start_slew", lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("fail to operate (Error Code: 0x4ff)")))
+
+    with pytest.raises(RuntimeError, match="Telescope slew failed before plate solve") as exc_info:
+        tool._run_slew_and_plate_solve(
+            object_name="M45",
+            ra_hours=None,
+            dec_degrees=None,
+            protocol="http",
+            plate_solve_exposure_seconds=1.0,
+            file_stem=None,
+            bin_x=1,
+            bin_y=1,
+            enable_tracking=True,
+        )
+
+    text = str(exc_info.value)
+    assert "Error Code: 0x4ff" in text
+    assert "CanSlew=True" in text

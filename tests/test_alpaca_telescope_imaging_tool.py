@@ -510,6 +510,26 @@ def test_start_slew_falls_back_to_sync_when_async_raises_driver_error():
     assert scope.sync_calls == 1
 
 
+def test_start_slew_reports_async_error_when_sync_is_deprecated():
+    tool = Tools()
+
+    class FakeTelescope:
+        def __init__(self):
+            self.CanSlewAsync = True
+            self.CanSlew = True
+
+        def SlewToCoordinatesAsync(self, _ra: float, _dec: float):
+            raise RuntimeError("SlewToCoordinatesAsync fail: fail to operate (Error Code: 0x4ff)")
+
+        def SlewToCoordinates(self, _ra: float, _dec: float):
+            raise RuntimeError("Synchronous methods are deprecated, not available via Alpaca. (Error Code: 0x400)")
+
+    with pytest.raises(RuntimeError, match="Async slew failed and synchronous Alpaca slew is unavailable/deprecated") as exc_info:
+        tool._start_slew(FakeTelescope(), ra_hours=3.0, dec_degrees=24.0)
+
+    assert "0x4ff" in str(exc_info.value)
+
+
 def test_wait_for_slew_completion_uses_target_when_slewing_unavailable(monkeypatch):
     tool = Tools()
     tool.valves.slew_timeout_seconds = 1
@@ -569,8 +589,25 @@ def test_resolve_astap_binary_prefers_valve_path(tmp_path):
     binary.chmod(0o755)
 
     tool.valves.astap_binary_path = str(binary)
+    tool._is_binary_runnable = lambda _path: True
 
     assert tool._resolve_astap_binary() == str(binary)
+
+
+def test_resolve_astap_binary_skips_unrunnable_configured_path(monkeypatch, tmp_path):
+    tool = Tools()
+    bad = tmp_path / "astap_bad"
+    bad.write_text("#!/bin/sh\nexit 127\n", encoding="utf-8")
+    bad.chmod(0o755)
+
+    tool.valves.astap_binary_path = str(bad)
+
+    def fake_is_runnable(path: str) -> bool:
+        return not path.endswith("astap_bad")
+
+    monkeypatch.setattr(tool, "_is_binary_runnable", fake_is_runnable)
+
+    assert tool._resolve_astap_binary() is None
 
 
 def test_astap_looks_solved_from_output_text():
@@ -690,3 +727,24 @@ def test_run_slew_and_plate_solve_wraps_slew_failure_with_diagnostics(monkeypatc
     text = str(exc_info.value)
     assert "Error Code: 0x4ff" in text
     assert "CanSlew=True" in text
+
+
+def test_ensure_tracking_enabled_for_slew_returns_warning_when_tracking_stays_false():
+    tool = Tools()
+
+    class FakeTelescope:
+        def __init__(self):
+            self._tracking = False
+
+        @property
+        def Tracking(self):
+            return self._tracking
+
+        @Tracking.setter
+        def Tracking(self, _value):
+            # Simulate mount refusing tracking enable requests.
+            self._tracking = False
+
+    warning = tool._ensure_tracking_enabled_for_slew(FakeTelescope(), enable_tracking=True)
+    assert warning is not None
+    assert "Tracking could not be enabled before slew" in warning

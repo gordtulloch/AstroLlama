@@ -42,6 +42,7 @@ services:
       - ./logs:/app/logs
       - ./common:/app/common
       - ./mcp_server:/app/mcp_server
+      - /var/run/avahi-daemon/socket:/var/run/avahi-daemon/socket
     healthcheck:
       test: ["CMD", "python", "-c", "import socket; s=socket.create_connection(('127.0.0.1',8000), 2); s.close()"]
       interval: 15s
@@ -92,3 +93,4 @@ services:
       - ./certs:/certs:ro
       - ./mcp_server:/app/mcp_server
       - ./scripts:/app/scripts
+      - /var/run/avahi-daemon/socket:/var/run/avahi-daemon/socket

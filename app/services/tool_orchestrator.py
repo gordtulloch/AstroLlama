@@ -44,6 +44,36 @@ _MISTRAL_TOOL_RE = re.compile(r"\[TOOL_CALLS\]\s*(\[.*?\])", re.DOTALL)
 # Matches an image URL produced by the generate_map tool
 _IMAGE_URL_RE = re.compile(r"/api/files/[^\s]+\.png")
 _CHAT_CONTROL_RE = re.compile(r"<\|im_start\|>|<\|im_end\|>|<\|assistant\|>|<\|user\|>")
+_NO_RESULT_RE = re.compile(
+    r"\b(no\s+(?:useful\s+)?(?:search\s+)?results?|not\s+found|no\s+matches?|"
+    r"no\s+relevant|could\s+not\s+find|unable\s+to\s+find|returned\s+0)\b",
+    re.IGNORECASE,
+)
+
+
+def _strip_repeated_tail(text: str, min_phrase: int = 40, max_phrase: int = 300, repeats: int = 3) -> str:
+    """
+    Remove the looping suffix from *text*.  Walks backwards through phrase
+    lengths and cuts just before the first repeated occurrence is found.
+    Returns the (possibly trimmed) text.
+    """
+    for phrase_len in range(min(max_phrase, len(text) // repeats), min_phrase - 1, -1):
+        candidate = text[-phrase_len:]
+        # Count how many non-overlapping times candidate appears in text.
+        count = 0
+        pos = 0
+        first_pos = -1
+        while True:
+            idx = text.find(candidate, pos)
+            if idx < 0:
+                break
+            count += 1
+            if first_pos < 0:
+                first_pos = idx
+            pos = idx + phrase_len
+        if count >= repeats and first_pos >= 0:
+            return text[:first_pos].rstrip()
+    return text
 
 _ASR_ALIAS_MAP: dict[str, str] = {
     "delta cpi": "Delta Cephei",
@@ -70,6 +100,13 @@ _AAVSO_FINDER_INTENT_RE = re.compile(
     r"\b(aavso|finder\s+chart|variable\s+star\s+finder\s+chart)\b",
     re.IGNORECASE,
 )
+
+_WEBSITE_INTENT_RE = re.compile(
+    r"\b(on|from|at|check|visit)?\s*(their|the)?\s*(web\s*site|website|site|web\s*page|page)\b",
+    re.IGNORECASE,
+)
+_NEWS_SOURCE_RE = re.compile(r"\b(news|headline|headlines|article|articles|coverage|report)\b", re.IGNORECASE)
+_YOUTUBE_SOURCE_RE = re.compile(r"\b(youtube|video|videos|channel)\b", re.IGNORECASE)
 
 _ALPACA_CAPTURE_TARGET_PATTERNS = [
     re.compile(
@@ -208,6 +245,15 @@ def _extract_aavso_star_query(text: str) -> str | None:
     return None
 
 
+def _explicitly_requests_source_tool(text: str, tool_name: str) -> bool:
+    raw = str(text or "")
+    if tool_name in {"search_news", "summarize_news", "load_news_article_text"}:
+        return bool(_NEWS_SOURCE_RE.search(raw))
+    if tool_name == "search_youtube":
+        return bool(_YOUTUBE_SOURCE_RE.search(raw))
+    return True
+
+
 def _extract_alpaca_capture_request(text: str) -> dict[str, Any] | None:
     """Best-effort extraction for explicit telescope slew/capture commands."""
     raw = str(text or "").strip()
@@ -257,6 +303,45 @@ def _extract_alpaca_capture_request(text: str) -> dict[str, Any] | None:
         "exposure_count": exposure_count,
         "light_frame": light_frame,
     }
+
+
+def _extract_telescope_registration_request(text: str) -> dict[str, Any] | None:
+    """Best-effort extraction for explicit telescope registration commands."""
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+
+    lowered = raw.lower()
+    if "register" not in lowered or "telescope" not in lowered:
+        return None
+
+    platform: str | None = None
+    if "indi" in lowered:
+        platform = "indi"
+    elif "alpaca" in lowered:
+        platform = "alpaca"
+
+    if platform is None:
+        return None
+
+    addr_match = re.search(
+        r"\b(?:at|on)\s+([a-zA-Z0-9._-]+(?::\d{1,5})?)\b",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if not addr_match:
+        return None
+
+    address = addr_match.group(1).strip()
+    if not address:
+        return None
+
+    args: dict[str, Any] = {
+        "platform": platform,
+        "address": address,
+        "auto_select": True,
+    }
+    return args
 
 
 def _find_tool_name(tools: list[dict[str, Any]], candidates: list[str]) -> str | None:
@@ -584,7 +669,102 @@ def _prepare_llm_tool_content(tool_name: str, result: str) -> str:
             "- Keep the [Summarize](astrollama://...) action link for each paper.\n"
             "- Prefer returning the same linked list from the tool output before any added commentary.\n"
         )
+    if tool_name == "search_web":
+        return _prepare_search_web_llm_content(result)
     return result
+
+
+def _prepare_search_web_llm_content(result: str) -> str:
+    formatted_result = result
+    try:
+        parsed = json.loads(result)
+        if isinstance(parsed, list):
+            formatted_lines: list[str] = []
+            seen_signatures: set[str] = set()
+            for item in parsed:
+                if not isinstance(item, dict):
+                    continue
+                title = str(item.get("title") or item.get("description") or item.get("url") or "").strip()
+                url = str(item.get("url") or "").strip()
+                description = str(item.get("description") or item.get("long_desc") or "").strip()
+                signature = " | ".join(part for part in [title.lower(), url.lower(), description.lower()] if part)
+                if not signature or signature in seen_signatures:
+                    continue
+                seen_signatures.add(signature)
+                line = f"- {title or 'Untitled result'}"
+                if url:
+                    line += f" ({url})"
+                formatted_lines.append(line)
+                if description:
+                    formatted_lines.append(f"  Summary: {description}")
+                matched_page_url = str(item.get("matched_page_url") or "").strip()
+                matched_page_title = str(item.get("matched_page_title") or "").strip()
+                site_summary = str(item.get("site_summary") or "").strip()
+                if matched_page_url:
+                    page_label = matched_page_title or "Matched page"
+                    formatted_lines.append(f"  Matched page: {page_label} ({matched_page_url})")
+                if site_summary:
+                    formatted_lines.append(f"  Site summary: {site_summary}")
+                site_candidates = item.get("site_candidates") or []
+                if isinstance(site_candidates, list):
+                    for candidate in site_candidates[:3]:
+                        if not isinstance(candidate, dict):
+                            continue
+                        candidate_url = str(candidate.get("url") or "").strip()
+                        candidate_title = str(candidate.get("title") or "Candidate page").strip()
+                        candidate_summary = str(candidate.get("summary") or "").strip()
+                        if not candidate_url and not candidate_summary:
+                            continue
+                        label = candidate_title or "Candidate page"
+                        if candidate_url:
+                            formatted_lines.append(f"  Candidate: {label} ({candidate_url})")
+                        else:
+                            formatted_lines.append(f"  Candidate: {label}")
+                        if candidate_summary:
+                            formatted_lines.append(f"    Candidate summary: {candidate_summary}")
+                deep_results = item.get("deep_results") or []
+                if isinstance(deep_results, list):
+                    snippets = []
+                    for snippet in deep_results:
+                        cleaned_snippet = str(snippet).strip()
+                        if not cleaned_snippet:
+                            continue
+                        if description and cleaned_snippet == description:
+                            continue
+                        if cleaned_snippet in snippets:
+                            continue
+                        snippets.append(cleaned_snippet)
+                    if snippets:
+                        formatted_lines.append(f"  Notes: {' | '.join(snippets[:2])}")
+                if len(seen_signatures) >= 5:
+                    break
+            if formatted_lines:
+                formatted_result = "WEB SEARCH RESULTS:\n" + "\n".join(formatted_lines)
+        elif isinstance(parsed, dict) and parsed.get("error"):
+            formatted_result = f"WEB SEARCH ERROR: {parsed['error']}"
+    except Exception:
+        formatted_result = result
+
+    return (
+        "TOOL OUTPUT (web search results):\n"
+        f"{formatted_result}\n\n"
+        "RESPONSE FORMAT REQUIREMENT:\n"
+        "- Answer directly using the search results.\n"
+        "- Consolidate duplicate findings from multiple results into one statement.\n"
+        "- Do not repeat the same sentence or recommendation more than once.\n"
+        "- Paraphrase source wording instead of echoing boilerplate.\n"
+        "- If useful, mention the most relevant source link once.\n"
+        "- If the search results identify candidate pages but do not contain enough detail, call scrape_website once on the best candidate page URL (prefer Candidate or Matched page over the site homepage), then answer from the scraped content.\n"
+    )
+
+
+def _tool_result_has_no_hits(result: str) -> bool:
+    cleaned = str(result or "").strip()
+    if not cleaned:
+        return True
+    if cleaned in {"[]", "{}", "null", "None"}:
+        return True
+    return bool(_NO_RESULT_RE.search(cleaned))
 
 
 def _save_large_result(tool_name: str, result: str) -> tuple[str, str]:
@@ -643,6 +823,8 @@ async def run_chat(
       {"type": "error",       "message": "..."}
     """
     tools = mcp_client.tools if mcp_client.available else []
+    web_search_tool = _find_tool_name(tools, ["search_web", "web_search"])
+    scrape_website_tool = _find_tool_name(tools, ["scrape_website"])
     emit_tool_events = not settings.hide_tool_bubbles
     logger.debug("run_chat: %d tool(s) available to model: %s",
                 len(tools),
@@ -669,6 +851,7 @@ async def run_chat(
         if msg.get("role") == "user":
             last_user_text = str(msg.get("content") or "")
             break
+    website_intent = bool(_WEBSITE_INTENT_RE.search(last_user_text or ""))
 
     location_query = _extract_location_for_latlong_query(last_user_text)
     geocode_tool = _find_tool_name(tools, ["get_lat_long", "get_latlong"])
@@ -717,6 +900,40 @@ async def run_chat(
             return
         except Exception as exc:
             logger.warning("AAVSO fast-path failed, falling back to normal flow: %s", exc)
+
+    # Deterministic fast-path for explicit Alpaca slew/capture requests.
+    telescope_registration_args = _extract_telescope_registration_request(last_user_text)
+    telescope_registration_tool = _find_tool_name(
+        tools,
+        ["register_telescope"],
+    )
+    if telescope_registration_args and not telescope_registration_tool:
+        await _refresh_tools_from_mcp("telescope registration fast-path")
+        telescope_registration_tool = _find_tool_name(
+            tools,
+            ["register_telescope"],
+        )
+    if telescope_registration_args and telescope_registration_tool:
+        if emit_tool_events:
+            yield {"type": "tool_start", "name": telescope_registration_tool, "args": telescope_registration_args}
+        logger.info(
+            "Telescope registration fast-path tool call -> %s  args=%s",
+            telescope_registration_tool,
+            json.dumps(telescope_registration_args, ensure_ascii=False),
+        )
+        try:
+            raw_result = await mcp_client.call_tool(telescope_registration_tool, telescope_registration_args)
+            result_str = _serialize_tool_result(raw_result)
+            _append_hidden_tool_exchange(history, telescope_registration_tool, telescope_registration_args, result_str)
+            if emit_tool_events:
+                yield {"type": "tool_result", "name": telescope_registration_tool, "result": result_str}
+            yield {"type": "token", "text": result_str}
+            yield {"type": "done"}
+            return
+        except Exception as exc:
+            logger.warning("Telescope registration fast-path failed, falling back to normal flow: %s", exc)
+            if emit_tool_events:
+                yield {"type": "tool_error", "name": telescope_registration_tool, "error": str(exc)}
 
     # Deterministic fast-path for explicit Alpaca slew/capture requests.
     alpaca_current_solve_args = _extract_alpaca_current_plate_solve_request(last_user_text)
@@ -827,6 +1044,7 @@ async def run_chat(
             "1. Answer from your own training knowledge. If you know the answer, say it directly.\n"
             "2. If RAG context was injected above, use it to supplement your answer.\n"
             "3. Do NOT call any tool simply because the topic is astronomical or because you are uncertain.\n"
+            f"3a. If no local RAG context was injected, or a specialized lookup tool returns no useful results, call {web_search_tool or 'search_web'} once as a fallback for informational web lookup.\n"
             "4. Never call orchestrate for a single direct action that one tool can execute immediately.\n"
             "   - Example: 'Move the telescope to M45 and take a 10 second exposure' should call alpaca_slew_and_capture directly.\n"
             "   - Example: 'Slew to M45 and platesolve' should call alpaca_slew_and_plate_solve directly.\n"
@@ -849,14 +1067,36 @@ async def run_chat(
             "   - generate_constellation_map / generate_map: ONLY if the user asks to SEE or SHOW a chart or map.\n"
             "   - get_weather / get_latlong: ONLY for explicit weather or location queries.\n"
             "   - get_current_time: ONLY when the user asks what time it is.\n"
+            f"   - {web_search_tool or 'search_web'}: use as the fallback when local context is absent and other lookup tools return no results.\n"
+            f"   - {scrape_website_tool or 'scrape_website'}: after a web search identifies a likely page URL but the snippet is insufficient, call it once on the best returned page and answer from that page content.\n"
+            "   - search_news / summarize_news / search_youtube: use ONLY if the user explicitly asks for news feeds, news coverage, or YouTube videos/channels.\n"
             "7. If you do not know something, say so plainly. Do NOT call a tool as a substitute for not knowing.\n"
             "8. Do NOT call any tool more than once for the same question. In particular:\n"
             "   - After load_paper_html_text returns content, summarize it directly (no follow-up tools).\n"
             "   - After simbad tools return results, answer directly (no follow-up data lookups).\n"
+            "   - A search_web -> scrape_website sequence is allowed once when the web search only identifies the target page.\n"
         )
         llm_messages[0] = {
             **llm_messages[0],
             "content": llm_messages[0]["content"] + tool_policy,
+        }
+
+    if (
+        website_intent
+        and web_search_tool
+        and scrape_website_tool
+        and llm_messages
+        and llm_messages[0].get("role") == "system"
+    ):
+        llm_messages[0] = {
+            **llm_messages[0],
+            "content": llm_messages[0]["content"]
+            + (
+                "\n\nWEBSITE QUERY ROUTING:\n"
+                f"- The user asked for information from a website. First call {web_search_tool} to identify the most relevant page URL on that site.\n"
+                f"- If search snippets are insufficient, call {scrape_website_tool} once on the best page URL, then answer from scraped content.\n"
+                "- Do not switch to news or YouTube tools unless the user explicitly asked for those sources.\n"
+            ),
         }
 
     # Help the model recover likely speech-to-text mistakes using nearby context.
@@ -866,6 +1106,7 @@ async def run_chat(
             "content": llm_messages[0]["content"] + _ASR_DISAMBIGUATION_HINT,
         }
 
+    rag_context_injected = False
     if retriever and retriever.available and retriever.document_count > 0:
         user_msgs = [m for m in history if m.get("role") == "user"]
         if user_msgs:
@@ -892,6 +1133,18 @@ async def run_chat(
                     llm_messages.insert(0, {"role": "system", "content": rag_addition.strip()})
 
                 logger.debug("RAG: injected %d chunk(s) into context", len(chunks))
+                rag_context_injected = True
+
+    if web_search_tool and not rag_context_injected and llm_messages and llm_messages[0].get("role") == "system":
+        llm_messages[0] = {
+            **llm_messages[0],
+            "content": llm_messages[0]["content"]
+            + (
+                "\n\nRAG STATUS:\n"
+                "- No local knowledge-base context was injected for the latest user message.\n"
+                f"- If your own knowledge is insufficient, prefer a single {web_search_tool} call for web lookup.\n"
+            ),
+        }
 
     pending_image_url: str | None = None
     called_tool_names: set[str] = set()
@@ -904,6 +1157,7 @@ async def run_chat(
         assistant_content = ""
         # tool_calls_acc is keyed by index
         tool_calls_acc: dict[int, dict[str, Any]] = {}
+        loop_was_truncated = False
 
         try:
             async for chunk in llm_client.chat_stream(
@@ -912,11 +1166,18 @@ async def run_chat(
                 temperature=settings.temperature,
                 top_p=settings.top_p,
                 max_tokens=settings.max_tokens,
+                repetition_penalty=settings.repetition_penalty,
             ):
                 choices = chunk.get("choices", [])
                 if not choices:
                     continue
                 choice = choices[0]
+
+                # Loop truncation signal from the LLM client.
+                if choice.get("finish_reason") == "loop_truncated":
+                    loop_was_truncated = True
+                    break
+
                 delta = choice.get("delta", {})
 
                 # --- content tokens -----------------------------------------------
@@ -945,6 +1206,18 @@ async def run_chat(
 
         except LlamaServerUnavailableError as exc:
             yield {"type": "error", "message": str(exc)}
+            return
+
+        # --- Loop truncation: strip the repeated tail and emit a notice -----------
+        if loop_was_truncated:
+            assistant_content = _strip_repeated_tail(assistant_content)
+            notice = (
+                "\n\n*(Response truncated — the model started repeating itself. "
+                "Try raising the Repetition penalty in Settings, or rephrase your question.)*"
+            )
+            yield {"type": "token", "text": notice}
+            assistant_content += notice
+            yield {"type": "done"}
             return
 
         # --- Post-stream: compile tool calls --------------------------------------
@@ -976,6 +1249,27 @@ async def run_chat(
 
         for tc in tool_calls:
             name = tc["function"]["name"]
+
+            if (
+                website_intent
+                and name in {"search_news", "summarize_news", "load_news_article_text", "search_youtube"}
+                and not _explicitly_requests_source_tool(last_user_text, name)
+            ):
+                blocked_msg = (
+                    f"Tool '{name}' is blocked for this query because the user asked for website content. "
+                    f"Use {web_search_tool or 'search_web'} first, then {scrape_website_tool or 'scrape_website'} if needed."
+                )
+                logger.info("Tool call blocked (website intent) -> %s", name)
+                if emit_tool_events:
+                    yield {"type": "tool_error", "name": name, "error": blocked_msg}
+                tool_msg: dict[str, Any] = {
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": blocked_msg,
+                }
+                history.append(tool_msg)
+                llm_messages.append(tool_msg)
+                continue
 
             if name in called_tool_names:
                 duplicate_msg = (
@@ -1009,6 +1303,16 @@ async def run_chat(
                     json.dumps(disambiguation_changes, ensure_ascii=False),
                 )
 
+            if website_intent and web_search_tool and name == web_search_tool:
+                existing_query = str(args.get("query") or "").strip()
+                if existing_query != last_user_text:
+                    args["query"] = last_user_text
+                    logger.info(
+                        "Website-intent query expansion for %s: %s",
+                        name,
+                        json.dumps(args, ensure_ascii=False),
+                    )
+
             if emit_tool_events:
                 yield {"type": "tool_start", "name": name, "args": args}
             logger.info("Tool call → %s  args=%s", name, json.dumps(args, ensure_ascii=False)[:200])
@@ -1021,7 +1325,9 @@ async def run_chat(
                             name, len(result_str),
                             result_str[:1000] + ("..." if len(result_str) > 1000 else ""))
 
-                if len(result_str) > _LARGE_RESULT_THRESHOLD:
+                llm_prepared_content = _prepare_llm_tool_content(name, result_str)
+
+                if len(result_str) > _LARGE_RESULT_THRESHOLD and name != web_search_tool:
                     filename, url = _save_large_result(name, result_str)
                     logger.debug("Large result saved → %s", filename)
                     preview = result_str[:_LLM_PREVIEW_LEN]
@@ -1049,7 +1355,20 @@ async def run_chat(
                         pending_image_url = image_url
                         if emit_tool_events:
                             yield {"type": "tool_image", "name": name, "url": image_url}
-                    llm_content = _prepare_llm_tool_content(name, result_str)
+                    llm_content = llm_prepared_content
+
+                if (
+                    web_search_tool
+                    and name != web_search_tool
+                    and web_search_tool not in called_tool_names
+                    and _tool_result_has_no_hits(result_str)
+                ):
+                    llm_content = (
+                        f"{llm_content}\n\n"
+                        "The previous tool did not return any useful results. "
+                        f"If the user still needs factual information, call {web_search_tool} once with a concise search query. "
+                        "Do not repeat the failed tool."
+                    )
 
                 tool_msg: dict[str, Any] = {
                     "role": "tool",

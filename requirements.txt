@@ -34,3 +34,5 @@ retry-requests
 starplot
 alpyca>=3.1.2
 huggingface_hub>=0.32.0
+# pyindi-client is installed separately in the Dockerfile with
+# --no-build-isolation (see docker/Dockerfile.python-services).

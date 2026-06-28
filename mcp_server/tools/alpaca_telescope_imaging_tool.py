@@ -571,13 +571,7 @@ class Tools:
             self._ensure_device_connected(camera, "camera")
 
             self._ensure_telescope_ready_for_motion(telescope)
-
-            if enable_tracking:
-                try:
-                    telescope.Tracking = True
-                except Exception:
-                    # Some mounts may not support toggling Tracking; proceed and let slew fail if needed.
-                    pass
+            tracking_warning = self._ensure_tracking_enabled_for_slew(telescope, enable_tracking)
 
             try:
                 self._start_slew(telescope=telescope, ra_hours=target_ra, dec_degrees=target_dec)
@@ -588,6 +582,8 @@ class Tools:
                 )
             except Exception as exc:
                 diagnostics = self._format_telescope_motion_diagnostics(telescope)
+                if tracking_warning:
+                    diagnostics = f"{diagnostics}, TrackingWarning={tracking_warning}"
                 raise RuntimeError(
                     "Telescope slew failed before capture. "
                     f"Diagnostics: {diagnostics}. "
@@ -703,12 +699,7 @@ class Tools:
             self._ensure_device_connected(camera, "camera")
 
             self._ensure_telescope_ready_for_motion(telescope)
-
-            if enable_tracking:
-                try:
-                    telescope.Tracking = True
-                except Exception:
-                    pass
+            tracking_warning = self._ensure_tracking_enabled_for_slew(telescope, enable_tracking)
 
             try:
                 self._start_slew(telescope=telescope, ra_hours=target_ra, dec_degrees=target_dec)
@@ -719,6 +710,8 @@ class Tools:
                 )
             except Exception as exc:
                 diagnostics = self._format_telescope_motion_diagnostics(telescope)
+                if tracking_warning:
+                    diagnostics = f"{diagnostics}, TrackingWarning={tracking_warning}"
                 raise RuntimeError(
                     "Telescope slew failed before plate solve. "
                     f"Diagnostics: {diagnostics}. "
@@ -768,12 +761,15 @@ class Tools:
             return (
                 f"Alpaca slew and plate solve completed for {target_label}.\n"
                 f"Requested coordinates: RA={target_ra:.6f}h, DEC={target_dec:.6f}deg\n"
+                + (f"Tracking warning: {tracking_warning}\n" if tracking_warning else "")
+                +
                 f"Verification frame: {self._files_api_markdown_link(out_path)}\n"
                 f"Plate solved: {solved}\n"
                 f"Solved RA (hours): {solved_ra_hours}\n"
                 f"Solved DEC (degrees): {solved_dec_degrees}\n"
                 f"ASTAP command: {' '.join(shlex.quote(part) for part in cmd)}\n"
-                f"ASTAP return code: {proc.returncode}"
+                f"ASTAP return code: {proc.returncode}\n"
+                f"ASTAP output: {combined}"
             )
         finally:
             try:
@@ -886,7 +882,8 @@ class Tools:
                 f"Solved RA (hours): {solved_ra_hours}\n"
                 f"Solved DEC (degrees): {solved_dec_degrees}\n"
                 f"ASTAP command: {' '.join(shlex.quote(part) for part in cmd)}\n"
-                f"ASTAP return code: {proc.returncode}"
+                f"ASTAP return code: {proc.returncode}\n"
+                f"ASTAP output: {combined}"
             )
         finally:
             try:
@@ -993,7 +990,6 @@ class Tools:
     def _start_slew(self, telescope, ra_hours: float, dec_degrees: float) -> None:
         can_slew_async = bool(self._safe_getattr(telescope, "CanSlewAsync", default=True))
         can_slew_sync = bool(self._safe_getattr(telescope, "CanSlew", default=True))
-        async_error: Exception | None = None
 
         if not can_slew_async and not can_slew_sync:
             raise RuntimeError("Configured telescope reports CanSlew=False and CanSlewAsync=False")
@@ -1005,19 +1001,46 @@ class Tools:
                 # report Slewing=False even while a move is in progress and reject
                 # synchronous methods entirely.
                 return
-            except Exception as exc:
-                # Some mounts reject async slews (for example 0x4ff) but accept sync slews.
-                async_error = exc
+            except Exception as async_exc:
+                if can_slew_sync and hasattr(telescope, "SlewToCoordinates"):
+                    try:
+                        telescope.SlewToCoordinates(ra_hours, dec_degrees)
+                        return
+                    except Exception as sync_exc:
+                        sync_text = str(sync_exc or "")
+                        if "deprecated" in sync_text.lower() or "0x400" in sync_text.lower():
+                            raise RuntimeError(
+                                "Async slew failed and synchronous Alpaca slew is unavailable/deprecated. "
+                                f"Async error: {async_exc}"
+                            ) from async_exc
+                        raise
+                raise RuntimeError(f"Async slew failed: {async_exc}") from async_exc
 
         if not can_slew_sync:
-            if async_error is not None:
-                raise RuntimeError(
-                    "Configured telescope reports CanSlew=False and async slew failed: "
-                    f"{async_error}"
-                ) from async_error
             raise RuntimeError("Configured telescope reports CanSlew=False")
 
         telescope.SlewToCoordinates(ra_hours, dec_degrees)
+
+    def _ensure_tracking_enabled_for_slew(self, telescope, enable_tracking: bool) -> str | None:
+        if not bool(enable_tracking):
+            return None
+
+        tracking_set_error: Exception | None = None
+        try:
+            telescope.Tracking = True
+        except Exception as exc:
+            tracking_set_error = exc
+
+        tracking_state = self._safe_getattr(telescope, "Tracking", default=None)
+        if tracking_state is False:
+            if tracking_set_error is not None:
+                return (
+                    "Tracking could not be enabled before slew and telescope still reports Tracking=False. "
+                    f"Driver error: {tracking_set_error}"
+                )
+            return "Tracking could not be enabled before slew (telescope reports Tracking=False)"
+
+        return None
 
     def _format_telescope_motion_diagnostics(self, telescope) -> str:
         fields = [
@@ -1160,15 +1183,30 @@ class Tools:
 
             candidate_path = Path(candidate)
             if candidate_path.is_absolute() or candidate_path.parent != Path("."):
-                if candidate_path.exists() and os.access(candidate_path, os.X_OK):
+                if candidate_path.exists() and os.access(candidate_path, os.X_OK) and self._is_binary_runnable(str(candidate_path)):
                     return str(candidate_path)
                 continue
 
             resolved = shutil.which(candidate)
-            if resolved:
+            if resolved and self._is_binary_runnable(resolved):
                 return resolved
 
         return None
+
+    @staticmethod
+    def _is_binary_runnable(binary_path: str) -> bool:
+        try:
+            probe = subprocess.run(
+                [binary_path, "-h"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+            # Treat shell-level command failures (127) as not runnable.
+            return int(probe.returncode) != 127
+        except Exception:
+            return False
 
     @staticmethod
     def _astap_looks_solved(output_text: str, return_code: int) -> bool:

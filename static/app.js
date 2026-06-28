@@ -65,6 +65,7 @@
   const sTemperature  = document.getElementById("s-temperature");
   const sTopP         = document.getElementById("s-top_p");
   const sMaxTokens    = document.getElementById("s-max_tokens");
+  const sRepetitionPenalty = document.getElementById("s-repetition_penalty");
   const sSystemPrompt = document.getElementById("s-system_prompt");
   const sVoice        = document.getElementById("s-voice");
   const sVoiceRate    = document.getElementById("s-voice-rate");
@@ -139,6 +140,7 @@
       if (saved.temperature  !== undefined) sTemperature.value  = saved.temperature;
       if (saved.top_p        !== undefined) sTopP.value         = saved.top_p;
       if (saved.max_tokens   !== undefined) sMaxTokens.value    = saved.max_tokens;
+      if (saved.repetition_penalty !== undefined) sRepetitionPenalty.value = saved.repetition_penalty;
       if (saved.system_prompt !== undefined) sSystemPrompt.value = saved.system_prompt;
       if (typeof saved.open_viz_fullscreen === "boolean") {
         ui.preferFullscreenViz = saved.open_viz_fullscreen;
@@ -166,6 +168,7 @@
       temperature:   parseFloat(sTemperature.value),
       top_p:         parseFloat(sTopP.value),
       max_tokens:    parseInt(sMaxTokens.value, 10),
+      repetition_penalty: parseFloat(sRepetitionPenalty.value),
       system_prompt: sSystemPrompt.value,
       open_viz_fullscreen: ui.preferFullscreenViz,
       hide_tool_bubbles: ui.hideToolBubbles,
@@ -281,7 +284,7 @@
     btnMoreActions.textContent = nextOpen ? "Less" : "More";
   }
 
-  [sTemperature, sTopP, sMaxTokens, sSystemPrompt].forEach(el =>
+  [sTemperature, sTopP, sMaxTokens, sRepetitionPenalty, sSystemPrompt].forEach(el =>
     el.addEventListener("change", saveSettings)
   );
 
@@ -1212,9 +1215,27 @@
       .trim();
   }
 
+  // Events that fire in tight loops (auto-restart cycles, interim results) are
+  // throttled so they don't turn into a continuous stream of POST requests.
+  const _speechDebugThrottleMs = {
+    recognition_start: 10_000,
+    recognition_end:   10_000,
+    speech_interim:     5_000,
+    speech_wake_miss:   5_000,
+  };
+  const _speechDebugLastSent = {};
+
   function logSpeechDebug(event, details = {}) {
     const text = String(details.text || "").slice(0, 4096);
     if (!text) return;
+
+    const throttleMs = _speechDebugThrottleMs[event];
+    if (throttleMs) {
+      const now = Date.now();
+      const last = _speechDebugLastSent[event] || 0;
+      if (now - last < throttleMs) return;
+      _speechDebugLastSent[event] = now;
+    }
 
     const payload = {
       event,
@@ -2779,6 +2800,7 @@
         temperature:   parseFloat(sTemperature.value),
         top_p:         parseFloat(sTopP.value),
         max_tokens:    parseInt(sMaxTokens.value, 10),
+        repetition_penalty: parseFloat(sRepetitionPenalty.value),
         system_prompt: sSystemPrompt.value || null,
         hide_tool_bubbles: ui.hideToolBubbles,
       },

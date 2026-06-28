@@ -11,9 +11,18 @@ RUN apt-get update \
         build-essential \
         gcc \
         g++ \
+        git \
+        swig \
+        pkg-config \
         curl \
         ca-certificates \
         file \
+        dbus \
+        libdbus-1-dev \
+        libglib2.0-dev \
+        libindi-dev \
+        libcfitsio-dev \
+        libnova-dev \
         libglib2.0-0 \
         libgtk-3-0 \
         libx11-6 \
@@ -21,7 +30,13 @@ RUN apt-get update \
         libxrender1 \
         libxtst6 \
         libxi6 \
+        libnss-mdns \
     && rm -rf /var/lib/apt/lists/*
+
+# Enable mDNS (.local) resolution via the host's avahi-daemon socket.
+# NSS will try mdns4_minimal first; if the daemon socket is not mounted it
+# falls through to normal DNS without error.
+RUN sed -i 's/^\(hosts:.*\)dns\(.*\)$/\1mdns4_minimal [NOTFOUND=return] dns\2/' /etc/nsswitch.conf
 
 COPY astap/*.deb /tmp/astap/
 
@@ -38,5 +53,16 @@ RUN mkdir -p /opt/astap/data
 COPY requirements.txt ./
 RUN pip install --upgrade pip \
     && pip install -r requirements.txt
+
+# pyindi-client uses pyproject.toml and must be built against the system
+# libindi/SWIG headers.  --no-build-isolation skips pip's isolated build
+# environment so the SWIG-generated C extension can find libindiclient.a,
+# libnova, libcfitsio, etc.  setuptools and wheel must be pre-installed so
+# the build backend is available without isolation.
+# Pin to c79c1bf (Jan 22 2026) which is the first commit that builds cleanly
+# against the INDI 2.x headers shipped by Debian trixie's libindi-dev.
+RUN pip install setuptools wheel \
+    && pip install --no-build-isolation \
+        "git+https://github.com/indilib/pyindi-client.git@c79c1bf#egg=pyindi-client"
 
 COPY . .

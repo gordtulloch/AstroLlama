@@ -19,3 +19,7 @@ data/downloads/
 logs/
 
 static/readme screenshot.png
+
+certs/letsencrypt/
+certs/lib/
+certs/log/

@@ -51,7 +51,13 @@ ENV ASTAP_BINARY_PATH=/opt/astap/astap \
 RUN mkdir -p /opt/astap/data
 
 COPY requirements.txt ./
+# Pre-install the CPU-only torch wheel before the main requirements pass.
+# sentence-transformers depends on torch>=1.11.0 but does not require CUDA.
+# Without this, pip resolves the default CUDA wheel (~2.5 GB) even though
+# neither the mcp nor app container has GPU access.  Installing the CPU
+# variant first satisfies the torch constraint so pip won't fetch CUDA builds.
 RUN pip install --upgrade pip \
+    && pip install torch --index-url https://download.pytorch.org/whl/cpu \
     && pip install -r requirements.txt
 
 # pyindi-client uses pyproject.toml and must be built against the system

@@ -92,6 +92,43 @@ class Retriever:
             return 0
         return self._collection.count()
 
+    def query_with_metadata(self, text: str) -> list[dict]:
+        """
+        Return up to self.top_k relevant chunks, each as a dict with 'text' plus
+        all stored metadata fields (source, chunk, page_num, images, etc.).
+        Images field, if present, is returned as a list (decoded from JSON string).
+        Returns an empty list if RAG is unavailable.
+        """
+        if not self._available or self._collection is None:
+            return []
+        if self._collection.count() == 0:
+            return []
+        import json as _json
+        logger.debug("RAG query_with_metadata: %r", text[:120])
+        try:
+            results = self._collection.query(
+                query_texts=[text],
+                n_results=min(self.top_k, self._collection.count()),
+                include=["documents", "metadatas"],
+            )
+            docs: list[str] = results.get("documents", [[]])[0]
+            metas: list[dict] = results.get("metadatas", [[]])[0]
+            out: list[dict] = []
+            for doc, meta in zip(docs, metas or [{}] * len(docs)):
+                entry: dict = {"text": doc}
+                if meta:
+                    entry.update(meta)
+                if "images" in entry and isinstance(entry["images"], str):
+                    try:
+                        entry["images"] = _json.loads(entry["images"])
+                    except _json.JSONDecodeError:
+                        entry["images"] = []
+                out.append(entry)
+            return out
+        except Exception as exc:
+            logger.warning("ChromaDB query_with_metadata failed: %s", exc)
+            return []
+
     def query(self, text: str) -> list[str]:
         """
         Return up to self.top_k relevant text chunks for *text*.

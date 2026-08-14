@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
@@ -20,6 +22,70 @@ router = APIRouter()
 # In-memory conversation history store: conversation_id → list of messages.
 # A single-user local tool — no auth layer needed.
 _histories: dict[str, list[dict[str, Any]]] = {}
+
+
+def _build_context_suffix() -> str:
+    """
+    Return a system-prompt suffix with the observer's location, coordinates,
+    and current local time.  Reads from app_settings so the values can be
+    overridden via .env without touching code.
+    """
+    parts: list[str] = []
+
+    # Greeting with user's first name
+    if app_settings.user_first_name:
+        parts.append(
+            f"The user's name is {app_settings.user_first_name}. "
+            f"Greet them by first name at the start of each new conversation "
+            f"(e.g. 'Hello {app_settings.user_first_name}, what can I help you with today?')."
+        )
+
+    # Observer location and coordinates
+    lat = app_settings.observer_lat
+    lon = app_settings.observer_lon
+    tz_name = app_settings.observer_timezone
+    if app_settings.observer_location:
+        parts.append(
+            f"The observer is located in {app_settings.observer_location} "
+            f"(latitude {lat:.4f}, longitude {lon:.4f})."
+        )
+
+    # Current local time derived from the configured timezone
+    if tz_name:
+        try:
+            tz = ZoneInfo(tz_name)
+            now = datetime.now(tz)
+            utc_off = now.strftime("%z")
+            utc_off_fmt = f"UTC{utc_off[:3]}:{utc_off[3:]}"
+            parts.append(
+                f"The current local time at the observer's location is "
+                f"{now.strftime('%A, %B %d, %Y  %H:%M')} "
+                f"({tz_name}, {utc_off_fmt})."
+            )
+        except ZoneInfoNotFoundError:
+            logger.warning("Unknown IANA timezone in config: %r — skipping time injection", tz_name)
+
+    # Explicit Telescopius tool-call instruction with baked-in coordinates so
+    # the model never needs to invent values for location parameters.
+    parts.append(
+        f"TOOL USE RULES — you MUST follow these without exception: "
+        f"(1) When the user asks which planets or solar system bodies are visible, "
+        f"are up, or rise/set tonight, you MUST immediately call "
+        f"telescopius_solar_system_times with "
+        f"latitude={lat:.4f}, longitude={lon:.4f}, timezone='{tz_name}' — "
+        f"do NOT attempt to answer from memory. "
+        f"(2) When the user asks what to observe, what's visible, or wants target "
+        f"suggestions for tonight, you MUST immediately call "
+        f"telescopius_tonight_highlights with "
+        f"latitude={lat:.4f}, longitude={lon:.4f}, timezone='{tz_name}'. "
+        f"(3) When the user wants a filtered DSO search (by type, magnitude, or altitude), "
+        f"you MUST call telescopius_search_targets — omit latitude/longitude/timezone to "
+        f"use the configured defaults. "
+        f"Never generate planetary visibility or observation target lists from your own "
+        f"knowledge — always call the appropriate Telescopius tool first."
+    )
+
+    return "  ".join(parts)
 
 
 def _format_sse(event: dict[str, Any]) -> str:
@@ -46,6 +112,16 @@ async def chat(
 
     # Prepend system prompt from settings (only if no system msg already in history)
     system_prompt = body.settings.system_prompt or app_settings.default_system_prompt
+    # Append observer context (location, coordinates, local time, user greeting).
+    context_suffix = _build_context_suffix()
+    if context_suffix:
+        system_prompt = system_prompt.rstrip() + "  " + context_suffix
+    # Append a language instruction when a language is configured.
+    if app_settings.response_language:
+        system_prompt = (
+            system_prompt.rstrip()
+            + f"  Always respond in {app_settings.response_language}."
+        )
     has_system = any(m.get("role") == "system" for m in history)
     if system_prompt and not has_system:
         history.insert(0, {"role": "system", "content": system_prompt})

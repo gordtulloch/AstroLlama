@@ -17,10 +17,10 @@ RUN apt-get update \
         curl \
         ca-certificates \
         file \
+        cmake \
         dbus \
         libdbus-1-dev \
         libglib2.0-dev \
-        libindi-dev \
         libcfitsio-dev \
         libnova-dev \
         libglib2.0-0 \
@@ -31,12 +31,41 @@ RUN apt-get update \
         libxtst6 \
         libxi6 \
         libnss-mdns \
+        patchelf \
+        zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Enable mDNS (.local) resolution via the host's avahi-daemon socket.
 # NSS will try mdns4_minimal first; if the daemon socket is not mounted it
 # falls through to normal DNS without error.
 RUN sed -i 's/^\(hosts:.*\)dns\(.*\)$/\1mdns4_minimal [NOTFOUND=return] dns\2/' /etc/nsswitch.conf
+
+# Build INDI 2.x from source.  Debian trixie only ships libindi-dev 1.9.9;
+# pyindi-client v2.x (Jan 2026+) requires the INDI 2.x headers and is the
+# version needed for full telescope/device control functionality.
+#
+# Only the client library is built (server and drivers are not needed at
+# runtime — the container connects to an indiserver running on the host or
+# on the llama container).  This avoids pulling in Qt, V4L2, libgsl, libusb,
+# libjpeg, libcurl, and other driver-only dependencies.
+#
+# v2.2.3.1 is the latest release (GCC 15 hotfix, June 2026).
+ARG INDI_VERSION=v2.2.3.1
+RUN git clone --depth 1 --branch ${INDI_VERSION} \
+        https://github.com/indilib/indi.git /tmp/indi \
+    && cmake -S /tmp/indi -B /tmp/indi/build \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DINDI_BUILD_SERVER=OFF \
+        -DINDI_BUILD_DRIVERS=OFF \
+        -DINDI_BUILD_COMMON=OFF \
+        -DINDI_BUILD_QT_CLIENT=OFF \
+        -DINDI_BUILD_UNITTESTS=OFF \
+        -DINDI_BUILD_INTEGTESTS=OFF \
+    && cmake --build /tmp/indi/build -j$(nproc) \
+    && cmake --install /tmp/indi/build \
+    && ldconfig \
+    && rm -rf /tmp/indi
 
 COPY astap/*.deb /tmp/astap/
 
@@ -60,14 +89,15 @@ RUN pip install --upgrade pip \
     && pip install torch --index-url https://download.pytorch.org/whl/cpu \
     && pip install -r requirements.txt
 
-# pyindi-client uses pyproject.toml and must be built against the system
-# libindi/SWIG headers.  --no-build-isolation skips pip's isolated build
-# environment so the SWIG-generated C extension can find libindiclient.a,
-# libnova, libcfitsio, etc.  setuptools and wheel must be pre-installed so
-# the build backend is available without isolation.
-# Pin to c79c1bf (Jan 22 2026) which is the first commit that builds cleanly
-# against the INDI 2.x headers shipped by Debian trixie's libindi-dev.
-RUN pip install setuptools wheel \
+# pyindi-client uses a meson-python build backend and must be compiled against
+# the INDI 2.x headers installed above.  --no-build-isolation lets the build
+# reach the system libindiclient.so, libcfitsio, libnova, and the SWIG .i
+# files.  meson-python, meson, ninja and patchelf must all be pre-installed in
+# the current environment so they are available without an isolated build env.
+#
+# Pin to c79c1bf (Jan 22 2026) — the tip of master that introduced the SWIG
+# fixes for INDI 2.x headers (indiversion.h include, WidgetView template API).
+RUN pip install meson-python meson ninja pyproject-metadata \
     && pip install --no-build-isolation \
         "git+https://github.com/indilib/pyindi-client.git@c79c1bf#egg=pyindi-client"
 

@@ -34,5 +34,9 @@ retry-requests
 starplot
 alpyca>=3.1.2
 huggingface_hub>=0.32.0
+chonkie[semantic]>=1.0.0
+unstructured[pdf]>=0.15.0
+unstructured-inference>=0.7.0
 # pyindi-client is installed separately in the Dockerfile with
-# --no-build-isolation (see docker/Dockerfile.python-services).
+# --no-build-isolation after INDI 2.x is built from source.
+# See docker/Dockerfile.python-services for the meson-python build step.

@@ -109,6 +109,11 @@ app.include_router(files_router.router, prefix="/api")
 app.include_router(highlight_router.router)
 app.include_router(tools_router.router, prefix="/api")
 
+# Serve extracted RAG images at /images — populated by scripts/ingest.py --extract-images
+_images_dir = _REPO_ROOT / "data" / "images"
+_images_dir.mkdir(parents=True, exist_ok=True)
+app.mount("/images", StaticFiles(directory=str(_images_dir)), name="images")
+
 # Serve the static single-page UI
 _static_dir = _REPO_ROOT / "static"
 if _static_dir.exists():

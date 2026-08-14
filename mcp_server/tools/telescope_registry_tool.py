@@ -48,43 +48,55 @@ class Tools:
 
     async def register_telescope(
         self,
-        platform: Literal["alpaca", "indi"],
+        platform: str,
         address: str,
         name: str | None = None,
-        protocol: Literal["http", "https"] = "http",
+        protocol: str = "http",
         auto_select: bool = True,
     ) -> str:
         """Register a telescope profile and inventory devices from that server.
 
         Use this when a user asks to register an Alpaca or INDI telescope endpoint.
 
-        :param platform: Telescope platform type: alpaca or indi.
-        :param address: Server address in host:port form.
-        :param name: Optional display name.
-        :param protocol: Protocol for Alpaca device connections.
+        :param platform: Telescope platform type — pass exactly 'alpaca' or 'indi' (lowercase).
+        :param address: Server address in host:port form. A bare hostname defaults to port 80, which is almost never the Alpaca port — ZWO Seestar devices expose Alpaca on port 32323, so use 'seestar.local:32323' rather than just 'seestar.local'.
+        :param name: Optional nickname for the telescope, e.g. if the user says "named S30" or "call it S30", pass name='S30'. Shown in registration results and telescope listings. Defaults to a generated name like 'ALPACA seestar.local:32323' when omitted.
+        :param protocol: Protocol for Alpaca device connections — pass 'http' or 'https' (lowercase).
         :param auto_select: If true, make this profile the active telescope.
-        :returns: Registered profile and discovered device inventory.
+        :returns: A success/failure result with a 'success' boolean and a 'message' stating plainly whether the connection succeeded or failed (the profile is saved either way; call telescope_inventory or list_registered_telescopes for full device details).
         """
+        platform_norm = platform.strip().lower()
+        if platform_norm not in ("alpaca", "indi"):
+            raise ValueError(f"platform must be 'alpaca' or 'indi', got: {platform!r}")
+        protocol_norm = protocol.strip().lower()
+        if protocol_norm not in ("http", "https"):
+            protocol_norm = "http"
         return await asyncio.to_thread(
             self._register_telescope_sync,
-            platform,
+            platform_norm,
             address,
             name,
-            protocol,
+            protocol_norm,
             auto_select,
         )
 
     async def list_registered_telescopes(self) -> str:
         """List all telescope profiles currently registered.
 
-        :returns: Registered telescope profiles and active selection.
+        Use this when the user asks what telescopes are registered, or to list/show telescopes.
+
+        :returns: A short Markdown bullet list of registered telescope nicknames, each with platform, address, active marker, and telescope_id (needed for select_telescope).
         """
-        rows = [item.model_dump() for item in self.valves.telescopes]
-        payload = {
-            "active_telescope_id": self.valves.active_telescope_id,
-            "telescopes": rows,
-        }
-        return json.dumps(payload, indent=2)
+        if not self.valves.telescopes:
+            return "No telescopes registered yet. Use register_telescope to add one."
+
+        lines = ["Registered telescopes:"]
+        for item in self.valves.telescopes:
+            active_marker = " — active" if item.telescope_id == self.valves.active_telescope_id else ""
+            lines.append(
+                f"- **{item.name}** ({item.platform} @ {item.address}){active_marker} `{item.telescope_id}`"
+            )
+        return "\n".join(lines)
 
     async def select_telescope(self, telescope_id: str) -> str:
         """Select an existing telescope profile as the active one.
@@ -140,10 +152,10 @@ class Tools:
 
     def _register_telescope_sync(
         self,
-        platform: Literal["alpaca", "indi"],
+        platform: str,
         address: str,
         name: str | None,
-        protocol: Literal["http", "https"],
+        protocol: str,
         auto_select: bool,
     ) -> str:
         endpoint = str(address or "").strip()
@@ -189,20 +201,28 @@ class Tools:
         if auto_select:
             self._sync_platform_valves(profile)
 
-        payload = {
-            "status": "registered",
-            "active_telescope_id": self.valves.active_telescope_id,
-            "telescope": profile.model_dump(),
-            "message": (
-                "Telescope registered and selected. "
-                "Use telescope_inventory(refresh=true) to refresh devices later."
-            ),
-        }
-        if inventory_error is not None:
-            payload["inventory_warning"] = (
-                f"Telescope registered but could not reach the server to fetch live inventory: {inventory_error}. "
-                "Use telescope_inventory(refresh=true) once the server is reachable."
+        success = inventory_error is None
+        selected_clause = " and set as the active telescope" if auto_select else ""
+
+        if success:
+            device_count = len(inventory.get("devices", []))
+            message = (
+                f"SUCCESS: connected to '{profile.name}'{selected_clause}. "
+                f"Found {device_count} device(s) (telescope_id: {profile.telescope_id})."
             )
+        else:
+            message = (
+                f"FAILED to connect to '{profile.name}': {inventory_error} "
+                f"The telescope profile was still saved{selected_clause} so you can retry once it's reachable "
+                f"(telescope_id: {profile.telescope_id}). Run telescope_inventory(refresh=true) to retry."
+            )
+
+        payload = {
+            "success": success,
+            "message": message,
+            "telescope_id": profile.telescope_id,
+            "active_telescope_id": self.valves.active_telescope_id,
+        }
         return json.dumps(payload, indent=2)
 
     def _refresh_inventory_sync(self, telescope_id: str) -> str:
@@ -226,7 +246,7 @@ class Tools:
             indent=2,
         )
 
-    def _discover_inventory(self, platform: Literal["alpaca", "indi"], address: str) -> dict[str, Any]:
+    def _discover_inventory(self, platform: str, address: str) -> dict[str, Any]:
         if platform == "alpaca":
             return self._discover_alpaca_inventory(address)
         return discover_indi_devices(address, timeout_seconds=float(self.valves.indi_discovery_timeout_seconds))
@@ -245,9 +265,16 @@ class Tools:
             server_description = management.description(endpoint)
             configured_devices = management.configureddevices(endpoint)
         except Exception as exc:
+            port_hint = (
+                " No port was given, so this defaulted to port 80 — that is "
+                "almost never the Alpaca port. ZWO Seestar devices expose "
+                f"Alpaca on port 32323; try '{endpoint}:32323'."
+                if ":" not in endpoint
+                else ""
+            )
             raise RuntimeError(
                 "Unable to reach Alpaca server at "
-                f"'{endpoint}'. Verify host:port and server availability."
+                f"'{endpoint}'. Verify host:port and server availability.{port_hint}"
             ) from exc
 
         normalized_devices: list[dict[str, Any]] = []
@@ -284,7 +311,7 @@ class Tools:
             "recommended_camera_device_number": camera_numbers[0] if len(camera_numbers) == 1 else None,
         }
 
-    def _normalized_address(self, platform: Literal["alpaca", "indi"], address: str) -> str:
+    def _normalized_address(self, platform: str, address: str) -> str:
         raw = str(address or "").strip()
         if platform == "indi":
             return normalize_indi_address(raw)

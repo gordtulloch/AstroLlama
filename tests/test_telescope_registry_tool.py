@@ -54,17 +54,28 @@ async def test_register_multiple_telescopes_and_select(tmp_path, monkeypatch):
         )
     )
 
-    assert first["status"] == "registered"
-    assert second["status"] == "registered"
+    assert first["success"] is True
+    assert second["success"] is True
+    assert "Seestar" in first["message"]
+    assert "SPAO" in second["message"]
     assert len(tool.valves.telescopes) == 2
-    assert second["telescope"]["address"] == "spao-s30.local:7624"
+    indi_profile = next(item for item in tool.valves.telescopes if item.platform == "indi")
+    assert indi_profile.address == "spao-s30.local:7624"
 
-    profiles = json.loads(await tool.list_registered_telescopes())
-    assert len(profiles["telescopes"]) == 2
+    listing = await tool.list_registered_telescopes()
+    assert "Seestar" in listing
+    assert "SPAO" in listing
+    assert "— active" in listing  # only the auto-selected Seestar profile
 
     indi_id = next(item.telescope_id for item in tool.valves.telescopes if item.platform == "indi")
     selected = json.loads(await tool.select_telescope(indi_id))
     assert selected["active_telescope"]["platform"] == "indi"
+
+    listing_after_select = await tool.list_registered_telescopes()
+    spao_line = next(line for line in listing_after_select.splitlines() if "SPAO" in line)
+    assert "— active" in spao_line
+    seestar_line = next(line for line in listing_after_select.splitlines() if "Seestar" in line)
+    assert "— active" not in seestar_line
 
 
 @pytest.mark.asyncio
@@ -104,7 +115,8 @@ async def test_register_alpaca_syncs_default_valves(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_register_alpaca_unreachable_server(tmp_path, monkeypatch):
-    """Registration should succeed even when the Alpaca server cannot be reached."""
+    """Registration should save the profile but clearly report failure when the
+    Alpaca server cannot be reached."""
     store = ValvesStore(tmp_path / "tool_valves.sqlite3")
     tool = Tools(store=store)
 
@@ -125,10 +137,12 @@ async def test_register_alpaca_unreachable_server(tmp_path, monkeypatch):
         )
     )
 
-    assert result["status"] == "registered"
-    assert result["telescope"]["address"] == "seestar.local"
-    assert result["telescope"]["platform"] == "alpaca"
-    assert result["active_telescope_id"] == result["telescope"]["telescope_id"]
-    assert "inventory_warning" in result
-    assert "seestar.local" in result["inventory_warning"]
-    assert result["telescope"]["inventory"] == {}
+    assert result["success"] is False
+    assert "FAILED" in result["message"]
+    assert "seestar.local" in result["message"]
+    assert result["active_telescope_id"] == result["telescope_id"]
+
+    profile = tool.valves.telescopes[0]
+    assert profile.address == "seestar.local"
+    assert profile.platform == "alpaca"
+    assert profile.inventory == {}

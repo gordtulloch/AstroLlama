@@ -6,9 +6,9 @@ import shutil
 from pathlib import Path
 
 
-DEFAULT_MODEL_REPO = "bartowski/Qwen2.5-3B-Instruct-GGUF"
-DEFAULT_MODEL_FILENAME = "Qwen2.5-3B-Instruct-Q8_0.gguf"
-DEFAULT_OUTPUT_NAME = "qwen2.5-3b-instruct-q8_0.gguf"
+DEFAULT_MODEL_REPO = "bartowski/Qwen2.5-14B-Instruct-GGUF"
+DEFAULT_MODEL_FILENAME = "Qwen2.5-14B-Instruct-Q4_K_M.gguf"
+DEFAULT_OUTPUT_NAME = "qwen2.5-14b-instruct-q4_k_m.gguf"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -22,7 +22,7 @@ def build_parser() -> argparse.ArgumentParser:
         "repo_id",
         nargs="?",
         default=os.getenv("HF_MODEL_REPO", DEFAULT_MODEL_REPO),
-        help="Hugging Face repository id, for example bartowski/Qwen2.5-3B-Instruct-GGUF.",
+        help="Hugging Face repository id, for example bartowski/Qwen2.5-14B-Instruct-GGUF.",
     )
     parser.add_argument(
         "filename",

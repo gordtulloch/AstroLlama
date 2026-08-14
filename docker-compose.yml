@@ -94,3 +94,49 @@ services:
       - ./mcp_server:/app/mcp_server
       - ./scripts:/app/scripts
       - /var/run/avahi-daemon/socket:/var/run/avahi-daemon/socket
+
+  # ---------------------------------------------------------------------------
+  # Ingestion container — GPU-enabled, carries Marker + unstructured-inference.
+  # Runs as a one-shot job; does NOT start with normal `docker compose up`.
+  #
+  # Usage:
+  #   docker compose --profile ingest build ingest          # first-time build
+  #   docker compose --profile ingest run --rm ingest \
+  #     python scripts/ingest.py --source /books/my.pdf --extract-images
+  #   docker compose --profile ingest run --rm ingest \
+  #     python scripts/test_pdf_ingest.py --pdf /books/my.pdf --pages 1-20
+  # ---------------------------------------------------------------------------
+  ingest:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.ingest
+    container_name: astrollama-ingest
+    profiles: ["ingest"]
+    working_dir: /app
+    env_file: .env
+    environment:
+      # torch dynamo conflicts with chromadb's dispatch table in torch 2.x
+      TORCHDYNAMO_DISABLE: "1"
+    volumes:
+      - ./app:/app/app
+      - ./common:/app/common
+      - ./scripts:/app/scripts
+      - ./data:/app/data
+      # Named volume: Marker / HuggingFace / unstructured model weights.
+      # Survives container removal so models are not re-downloaded each run.
+      - marker_cache:/root/.cache
+      # Mount your book library as /books (configure BOOKS_PATH in .env)
+      - ${BOOKS_PATH}:/books:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  # Shared model weight cache for the ingest container.
+  # Stores Marker (surya/texify), unstructured-inference (YOLOX),
+  # and HuggingFace sentence-transformers models.
+  marker_cache:

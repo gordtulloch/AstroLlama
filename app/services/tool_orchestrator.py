@@ -12,7 +12,7 @@ from typing import Any
 import httpx
 
 from app.models.chat import ChatSettings
-from app.services.llm import LLMClient, LlamaServerUnavailableError
+from app.services.llm import LLMClient, LlamaServerUnavailableError, _strip_emoji_spam_tail
 from app.services.mcp_client import MCPClient
 from app.services.retriever import Retriever
 
@@ -49,6 +49,208 @@ _NO_RESULT_RE = re.compile(
     r"no\s+relevant|could\s+not\s+find|unable\s+to\s+find|returned\s+0)\b",
     re.IGNORECASE,
 )
+
+# Matches a message that is ENTIRELY a greeting/chitchat phrase (anchored
+# start-to-end, so "hi" matches but "hi, what's visible tonight" does not).
+# Small models tend to call a tool reflexively whenever any tools are
+# offered, regardless of system-prompt instructions not to — so for these
+# messages we suppress tools outright rather than relying on the model to
+# behave (see the trivial-chitchat short-circuit in run_chat()).
+_TRIVIAL_CHITCHAT_RE = re.compile(
+    r"^(hi|hello|hey|yo|sup|"
+    r"good\s*(morning|afternoon|evening|night)|"
+    r"how\s*(are\s*you|('?s|is)\s*it\s*going)|"
+    r"thanks?|thank\s*you|thx|"
+    r"ok|okay|cool|great|nice(\s*one)?|"
+    r"bye|goodbye|see\s*ya|good\s*night)"
+    r"(\s*(there|friend|buddy|everyone|all))?"
+    r"[\s!.,?]*$",
+    re.IGNORECASE,
+)
+
+# ---------------------------------------------------------------------------
+# Intent-based tool subsetting
+# ---------------------------------------------------------------------------
+# With 51 tool schemas in context a 3B model can't reason well about which to
+# use — it wastes ~30% of a 8192-token context just on schema text, and tends
+# to pick the wrong tool or chain spurious follow-ups.  Detecting query intent
+# from keywords and offering only the relevant tool subset (typically 8-15
+# tools instead of 51) dramatically improves selection accuracy.
+#
+# Each bucket is (compiled_pattern, frozenset_of_tool_names).  Multiple
+# buckets can match — their tool sets are unioned.  No match = all tools
+# (current safe fallback).
+
+_SCOPE_MANAGEMENT_RE = re.compile(
+    r"(?:"
+    r"\blist\s+registered\b|"
+    # action verb within 50 chars of "telescope(s)"
+    r"(?:\b(?:list|register|select|choose|add|park|unpark|switch|show|view)\b.{0,50}?\btelescopes?\b)|"
+    # "telescope(s)" within 50 chars of a management keyword
+    r"(?:\btelescopes?\b.{0,50}?\b(?:inventory|status|select|park|unpark|list)\b)|"
+    r"\bmy\s+(?:registered\s+)?telescopes?\b|"
+    r"\bwhat\s+telescopes?\b|"
+    r"\bavailable\s+telescopes?\b"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+_SCOPE_MANAGEMENT_TOOLS = frozenset({
+    "list_registered_telescopes", "register_telescope", "select_telescope",
+    "telescope_inventory", "telescope_server_status", "telescope_park",
+    "telescope_unpark", "telescope_camera_diagnostics",
+    "alpaca_server_status", "indi_server_status",
+    "get_current_time",
+})
+
+_IMAGING_CONTROL_RE = re.compile(
+    # No trailing \b — stems like "plate.?solv" must also match "plate solve",
+    # "captures" must match "capture", "images" must match "image", etc.
+    r"\b(?:slew|point|capture|image|exposure|photograph|shoot|record|"
+    r"plate.?solve?|astap|start.?capture|stop.?capture|job.?status|"
+    r"camera|focus|filter.?wheel)",
+    re.IGNORECASE,
+)
+_IMAGING_CONTROL_TOOLS = frozenset({
+    "alpaca_slew_and_capture", "alpaca_slew_and_capture_start",
+    "alpaca_capture_job_status", "alpaca_slew_and_plate_solve",
+    "alpaca_plate_solve_current_position", "alpaca_camera_diagnostics",
+    "alpaca_park_telescope", "alpaca_unpark_telescope",
+    "telescope_park", "telescope_unpark", "telescope_camera_diagnostics",
+    "telescope_server_status", "astap_plate_solve", "astap_status",
+    "list_registered_telescopes",
+})
+
+_OBSERVE_TONIGHT_RE = re.compile(
+    r"\b(tonight|visible|observe|observation|what.{0,20}(up|see|watch)|"
+    r"best\s+target|planet.{0,20}(rise|set|transit|up)|solar\s+system|"
+    r"what.{0,20}(look\s+at|view)|sky\s+(tonight|plan)|observe\s+from|"
+    r"telescopius)\b",
+    re.IGNORECASE,
+)
+_OBSERVE_TONIGHT_TOOLS = frozenset({
+    "telescopius_tonight_highlights", "telescopius_solar_system_times",
+    "telescopius_search_targets", "telescopius_observation_lists",
+    "telescopius_observation_list_targets", "telescopius_my_equipment",
+    "get_current_time", "get_weather",
+})
+
+_ASTRONOMY_LOOKUP_RE = re.compile(
+    r"\b(look\s*up|simbad|coordinates?\s+of|NGC|IC\s*\d|M\s*\d|"
+    r"what\s+is\s+[A-Z]|constellation|star\s+(chart|map|field)|"
+    r"finder\s+chart|aavso|variable\s+star|nebula|galaxy|cluster|"
+    r"generate.{0,20}(map|chart)|show.{0,20}(map|chart))\b",
+    re.IGNORECASE,
+)
+_ASTRONOMY_LOOKUP_TOOLS = frozenset({
+    "simbad_lookup_object", "simbad_search", "generate_constellation_map",
+    "generate_aavso_map", "generate_map", "variable_comparison_stars",
+    "search_papers", "load_paper_html_text", "search_web", "get_lat_long",
+})
+
+_WEB_NEWS_RE = re.compile(
+    r"\b(news|headline|search\s+(the\s+web|online|for)|website|article|"
+    r"youtube|video|paper|research|arxiv|weather|latitude|longitude|"
+    r"what\s+time|current\s+time)\b",
+    re.IGNORECASE,
+)
+_WEB_NEWS_TOOLS = frozenset({
+    "search_web", "scrape_website", "search_news", "summarize_news",
+    "load_news_article_text", "top_headlines", "get_news",
+    "search_papers", "load_paper_html_text",
+    "search_youtube", "play_video",
+    "get_weather", "get_lat_long", "get_latlong", "get_current_time",
+    "telescopius_astronomy_news", "telescopius_quote_of_the_day",
+})
+
+# wolframAlpha is ONLY appropriate for explicit mathematical work — calculations,
+# equations, solving for variables, unit conversions, and similar computation.
+# It must NOT appear in any other bucket or the fallback set; the model will
+# otherwise call it for conceptual/factual questions where it's useless.
+_MATH_RE = re.compile(
+    r"(?:"
+    # word-stem prefixes — no trailing \b since stems like "calculat" must also
+    # match "calculate", "calculation", "computed", "solving", etc.
+    r"\b(?:calculat|comput|solv(?:e\s+for)?|evaluat|simplif|factor|integrat|"
+    r"differentiat|derivative|trigonometr|algebra|calculus|geometry|"
+    r"linear\s+algebra|probabilit|statistic)|"
+    r"\bunit\s+convers|\bconvert\s+\d|\bhow\s+many\s+\w+\s+in\s+\d|"
+    r"\d+\s*[\+\-\*\/\^%]\s*\d|"
+    r"\bsqrt\b|\bsquare\s+root\s+of\b|\blogarithm\b|\bfactorial\b|"
+    r"\bwhat\s+is\s+\d[\d\s\+\-\*\/\^%\.]*\d\b"
+    r")",
+    re.IGNORECASE,
+)
+_MATH_TOOLS = frozenset({"wolframAlpha", "search_web"})
+
+_TOOL_INTENT_BUCKETS: list[tuple[re.Pattern[str], frozenset[str]]] = [
+    (_SCOPE_MANAGEMENT_RE, _SCOPE_MANAGEMENT_TOOLS),
+    (_IMAGING_CONTROL_RE, _IMAGING_CONTROL_TOOLS),
+    (_OBSERVE_TONIGHT_RE, _OBSERVE_TONIGHT_TOOLS),
+    (_ASTRONOMY_LOOKUP_RE, _ASTRONOMY_LOOKUP_TOOLS),
+    (_WEB_NEWS_RE, _WEB_NEWS_TOOLS),
+    (_MATH_RE, _MATH_TOOLS),
+]
+
+# When no intent bucket matches, use this reduced core set rather than all 50
+# tools. This prevents domain-specific tools (wolframAlpha, telescope imaging,
+# INDI discovery, etc.) from being offered for general knowledge questions.
+_CORE_FALLBACK_TOOLS = frozenset({
+    "search_web", "scrape_website",
+    "get_current_time", "get_weather", "get_latlong",
+    "simbad_lookup_object", "simbad_search",
+    "telescopius_tonight_highlights", "telescopius_solar_system_times",
+    "generate_constellation_map", "generate_aavso_map",
+    "list_registered_telescopes",
+})
+
+
+def _subset_tools_for_query(
+    query: str,
+    all_tools: list[dict],
+) -> list[dict]:
+    """Return a subset of *all_tools* relevant to *query*.
+
+    Matches the query against intent buckets; unions matching buckets' tool
+    sets.  Returns the full list unchanged when no bucket matches (safe
+    fallback — the model still gets everything for unrecognised queries).
+    """
+    matched: set[str] = set()
+    for pattern, tool_names in _TOOL_INTENT_BUCKETS:
+        if pattern.search(query):
+            matched |= tool_names
+    if not matched:
+        # No intent bucket matched — use the reduced core fallback rather than
+        # all 50 tools. This prevents domain-specific tools (wolframAlpha,
+        # telescope imaging, INDI) from being offered for general knowledge
+        # questions like "tell me about gravitational lensing".
+        matched = _CORE_FALLBACK_TOOLS
+    subset = [t for t in all_tools if (t.get("function") or {}).get("name") in matched]
+    # Guarantee at least search_web as a general fallback in every subset so
+    # the model can always do a web lookup if its primary tools fail.
+    if subset and not any((t.get("function") or {}).get("name") == "search_web" for t in subset):
+        web = next((t for t in all_tools if (t.get("function") or {}).get("name") == "search_web"), None)
+        if web:
+            subset.append(web)
+    return subset
+
+
+# Tools that produce a self-contained final answer — after these succeed,
+# suppress further tool calls for the turn so the model can't chain spurious
+# follow-ups (e.g. calling wolframAlpha after list_registered_telescopes).
+_TERMINAL_TOOLS: frozenset[str] = frozenset({
+    "list_registered_telescopes",
+    "register_telescope",
+    "select_telescope",
+    "telescope_inventory",
+    "get_current_time",
+    "get_weather",
+    "telescopius_tonight_highlights",
+    "telescopius_solar_system_times",
+    "telescopius_search_targets",
+    "telescopius_astronomy_news",
+    "telescopius_quote_of_the_day",
+    "variable_comparison_stars",
+})
 
 
 def _strip_repeated_tail(text: str, min_phrase: int = 40, max_phrase: int = 300, repeats: int = 3) -> str:
@@ -851,6 +1053,31 @@ async def run_chat(
         if msg.get("role") == "user":
             last_user_text = str(msg.get("content") or "")
             break
+
+    # Trivial chitchat never needs a tool call. Don't even offer tools for
+    # the turn — this makes a spurious tool call structurally impossible
+    # instead of relying on the system prompt's "don't call tools for casual
+    # conversation" instruction, which small models frequently ignore.
+    if tools and _TRIVIAL_CHITCHAT_RE.match(last_user_text.strip()):
+        logger.info("Trivial chitchat detected (%r) — suppressing tools for this turn", last_user_text)
+        tools = []
+        web_search_tool = None
+        scrape_website_tool = None
+    elif tools:
+        # Intent-based subsetting: reduce 51 tools to only those relevant
+        # to this query's detected topic bucket(s).  Offering all 51 schemas
+        # to a 3B model consumes ~30 % of its context budget before any
+        # conversation and causes it to pick wrong or unrelated tools.
+        tools = _subset_tools_for_query(last_user_text, tools)
+        web_search_tool = _find_tool_name(tools, ["search_web", "web_search"])
+        scrape_website_tool = _find_tool_name(tools, ["scrape_website"])
+        logger.info(
+            "Tool subset for query %r: %d tool(s): %s",
+            last_user_text[:60],
+            len(tools),
+            [t["function"]["name"] for t in tools],
+        )
+
     website_intent = bool(_WEBSITE_INTENT_RE.search(last_user_text or ""))
 
     location_query = _extract_location_for_latlong_query(last_user_text)
@@ -1041,6 +1268,11 @@ async def run_chat(
         tool_names = [t["function"]["name"] for t in tools]
         tool_policy = (
             "\n\nTOOL USE POLICY (follow strictly):\n"
+            "0. KNOWLEDGE FIRST (highest priority): For conceptual or explanatory questions "
+            "('What is X?', 'Tell me about X', 'Explain X', 'How does X work?', 'Describe X') "
+            "answer directly from your training knowledge WITHOUT calling any tool. "
+            "These do not require live data. Only override this rule when the user explicitly "
+            "says 'look up', 'search', 'current', 'tonight', 'live', or 'latest'.\n"
             "1. Answer from your own training knowledge. If you know the answer, say it directly.\n"
             "2. If RAG context was injected above, use it to supplement your answer.\n"
             "3. Do NOT call any tool simply because the topic is astronomical or because you are uncertain.\n"
@@ -1070,6 +1302,12 @@ async def run_chat(
             f"   - {web_search_tool or 'search_web'}: use as the fallback when local context is absent and other lookup tools return no results.\n"
             f"   - {scrape_website_tool or 'scrape_website'}: after a web search identifies a likely page URL but the snippet is insufficient, call it once on the best returned page and answer from that page content.\n"
             "   - search_news / summarize_news / search_youtube: use ONLY if the user explicitly asks for news feeds, news coverage, or YouTube videos/channels.\n"
+            "   - wolframAlpha: ONLY for explicit mathematical work — solving equations, numerical calculations, "
+            "unit conversions, and computing formulas. "
+            "Examples that warrant it: 'solve x^2+2x+1=0', 'what is 15% of 340', 'convert 50 km/h to mph', "
+            "'calculate the orbital period of a satellite at 400 km'. "
+            "NEVER call wolframAlpha for definitions, concepts, factual questions, telescope lookups, "
+            "or anything that can be answered from training knowledge.\n"
             "7. If you do not know something, say so plainly. Do NOT call a tool as a substitute for not knowing.\n"
             "8. Do NOT call any tool more than once for the same question. In particular:\n"
             "   - After load_paper_html_text returns content, summarize it directly (no follow-up tools).\n"
@@ -1111,29 +1349,44 @@ async def run_chat(
         user_msgs = [m for m in history if m.get("role") == "user"]
         if user_msgs:
             query_text = user_msgs[-1].get("content", "")
-            chunks = retriever.query(query_text)
-            if chunks:
-                clean_chunks = [_sanitize_prompt_text(c) for c in chunks]
-                clean_chunks = [c for c in clean_chunks if c]
-                context_text = "\n\n---\n\n".join(clean_chunks)
-                rag_addition = (
-                    "\n\nThe following context was retrieved from the local knowledge base. "
-                    "Use it to help answer the question.\n\n"
-                    f"{context_text}"
-                )
+            rag_results = retriever.query_with_metadata(query_text)
+            if rag_results:
+                # Build image mention lines so the LLM can reference them
+                rag_image_urls: list[str] = []
+                context_parts: list[str] = []
+                for r in rag_results:
+                    chunk_text = _sanitize_prompt_text(r.get("text", ""))
+                    if not chunk_text:
+                        continue
+                    images: list[str] = r.get("images") or []
+                    if images:
+                        img_refs = "  ".join(f"[Figure: /images/{p}]" for p in images)
+                        chunk_text = chunk_text + "\n" + img_refs
+                        rag_image_urls.extend(f"/images/{p}" for p in images)
+                    context_parts.append(chunk_text)
 
-                if llm_messages and llm_messages[0].get("role") == "system":
-                    # Append to existing system message (copy, don't modify history)
-                    llm_messages[0] = {
-                        **llm_messages[0],
-                        "content": llm_messages[0]["content"] + rag_addition,
-                    }
-                else:
-                    # No system message yet — prepend one
-                    llm_messages.insert(0, {"role": "system", "content": rag_addition.strip()})
+                if context_parts:
+                    context_text = "\n\n---\n\n".join(context_parts)
+                    rag_addition = (
+                        "\n\nThe following context was retrieved from the local knowledge base. "
+                        "Use it to help answer the question.\n\n"
+                        f"{context_text}"
+                    )
 
-                logger.debug("RAG: injected %d chunk(s) into context", len(chunks))
-                rag_context_injected = True
+                    if llm_messages and llm_messages[0].get("role") == "system":
+                        llm_messages[0] = {
+                            **llm_messages[0],
+                            "content": llm_messages[0]["content"] + rag_addition,
+                        }
+                    else:
+                        llm_messages.insert(0, {"role": "system", "content": rag_addition.strip()})
+
+                    logger.debug("RAG: injected %d chunk(s) into context", len(context_parts))
+                    rag_context_injected = True
+
+                    # Emit tool_image events for any figures associated with retrieved chunks
+                    for img_url in rag_image_urls:
+                        yield {"type": "tool_image", "name": "rag_knowledge_base", "url": img_url}
 
     if web_search_tool and not rag_context_injected and llm_messages and llm_messages[0].get("role") == "system":
         llm_messages[0] = {
@@ -1158,6 +1411,7 @@ async def run_chat(
         # tool_calls_acc is keyed by index
         tool_calls_acc: dict[int, dict[str, Any]] = {}
         loop_was_truncated = False
+        emoji_spam_was_truncated = False
 
         try:
             async for chunk in llm_client.chat_stream(
@@ -1173,9 +1427,12 @@ async def run_chat(
                     continue
                 choice = choices[0]
 
-                # Loop truncation signal from the LLM client.
+                # Loop / emoji-spam truncation signals from the LLM client.
                 if choice.get("finish_reason") == "loop_truncated":
                     loop_was_truncated = True
+                    break
+                if choice.get("finish_reason") == "emoji_spam_truncated":
+                    emoji_spam_was_truncated = True
                     break
 
                 delta = choice.get("delta", {})
@@ -1214,6 +1471,22 @@ async def run_chat(
             notice = (
                 "\n\n*(Response truncated — the model started repeating itself. "
                 "Try raising the Repetition penalty in Settings, or rephrase your question.)*"
+            )
+            yield {"type": "token", "text": notice}
+            assistant_content += notice
+            yield {"type": "done"}
+            return
+
+        # --- Emoji-spam truncation: strip the degenerate tail and emit a notice ---
+        # Opposite advice from the loop case above: this happens when
+        # repetition_penalty is pushing the model into novel (emoji) tokens
+        # rather than letting it settle on ordinary words, so the fix is to
+        # lower it, not raise it.
+        if emoji_spam_was_truncated:
+            assistant_content = _strip_emoji_spam_tail(assistant_content)
+            notice = (
+                "\n\n*(Response truncated — the model degenerated into a run of emoji. "
+                "Try lowering the Repetition penalty in Settings, or rephrase your question.)*"
             )
             yield {"type": "token", "text": notice}
             assistant_content += notice
@@ -1385,6 +1658,10 @@ async def run_chat(
                     tools = []
                     force_no_more_tools = True
                     logger.info("Tool suppression enabled after load_paper_html_text")
+                elif name in _TERMINAL_TOOLS:
+                    tools = []
+                    force_no_more_tools = True
+                    logger.info("Terminal tool '%s' completed — suppressing further tool calls", name)
             except Exception as exc:
                 error_str = str(exc)
                 logger.warning("Tool error ← %s: %s", name, error_str)

@@ -1,0 +1,8 @@
+# Ingest-container-only dependencies.
+# Installed on top of requirements.txt inside docker/Dockerfile.ingest.
+# Do NOT add to the main requirements.txt — marker-pdf and its deps
+# (surya, texify, ~1.5 GB of model weights) are only needed during ingestion.
+# Prevent marker-pdf from downgrading torch below 2.6.0.
+# The dynamo dispatch conflict is handled via TORCHDYNAMO_DISABLE=1 in docker-compose.yml.
+torch>=2.6.0
+marker-pdf>=1.0.0

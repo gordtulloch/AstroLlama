@@ -1,0 +1,52 @@
+# Dedicated ingestion container — GPU-enabled, carries Marker + unstructured-inference.
+# The app and mcp containers use Dockerfile.python-services (CPU-only torch, no Marker).
+#
+# Base: nvidia/cuda runtime — stable, versioned, always available on Docker Hub.
+# Use Python 3.10 (3.10.12 on Ubuntu 22.04); avoid python3.11 which apt pins to
+# 3.11.0rc1 — missing sys.get_int_max_str_digits required by torch 2.6+ dynamo.
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=0 \
+    DEBIAN_FRONTEND=noninteractive \
+    # HuggingFace / Marker model cache lives in the marker_cache named volume
+    HF_HOME=/root/.cache/huggingface \
+    TORCH_HOME=/root/.cache/torch
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        python3.10 \
+        python3.10-dev \
+        python3-pip \
+        build-essential \
+        gcc \
+        g++ \
+        git \
+        curl \
+        ca-certificates \
+        tesseract-ocr \
+        tesseract-ocr-eng \
+        poppler-utils \
+        libgl1 \
+        libglib2.0-0 \
+    && ln -sf /usr/bin/python3.10 /usr/bin/python \
+    && ln -sf /usr/bin/python3.10 /usr/bin/python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt requirements-ingest.txt ./
+
+# Install PyTorch with CUDA 12.1 wheels first so subsequent pip installs
+# (sentence-transformers, unstructured, etc.) don't pull the CPU-only variant.
+# Then install the common requirements and the ingest-only requirements.
+RUN pip install --upgrade pip \
+    && pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124 \
+    && pip install -r requirements.txt \
+    && pip install -r requirements-ingest.txt
+
+# Copy source (live mounts in docker-compose override this at run time)
+COPY . .
+
+CMD ["python", "scripts/ingest.py", "--help"]

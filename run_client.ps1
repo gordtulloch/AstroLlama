@@ -19,3 +19,4 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host "Client available at http://localhost:${Port}" -ForegroundColor Green
+Write-Host "If APP_TLS_ENABLED=true and cert files are present, use https://localhost:${Port}" -ForegroundColor DarkGray

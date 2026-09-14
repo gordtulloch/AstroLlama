@@ -5,8 +5,8 @@ author_url: https://github.com/MartianInGreen/OpenWebUI-Tools
 version: 0.1.0
 """
 
-import urllib, requests, os
-from pydantic import BaseModel, Field #type: ignore
+import requests
+from pydantic import BaseModel
 from typing import Callable, Awaitable
 
 
@@ -19,7 +19,9 @@ class Tools:
         self.citation = True
 
     def scrape_website(
-        self, url: str, __event_emitter__: Callable[[dict], Awaitable[None]]
+        self,
+        url: str,
+        __event_emitter__: Callable[[dict], Awaitable[None]] | None = None,
     ) -> str:
         """
         Scrape any website and get redable markdown formatted results.
@@ -35,7 +37,7 @@ class Tools:
             url = baseURL  # + encoded_query
 
             try:
-                response = requests.get(url)
+                response = requests.get(url, timeout=20)
                 # print(response)
                 data = response.text
 

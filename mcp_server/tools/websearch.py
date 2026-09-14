@@ -1,398 +1,529 @@
-"""
-title: Web Search
-author: MartainInGreen
-author_url: https://github.com/MartianInGreen/OpenWebUI-Tools
-version: 0.1.0
-"""
+from __future__ import annotations
 
-import urllib, requests, os, json, time, re
-from dotenv import load_dotenv #type: ignore
+import json
+import logging
+import os
+import re
+from html import unescape
+from typing import Any, Literal
+from urllib.parse import quote, urljoin, urlparse
 
-# Prettier #print
-from pydantic import BaseModel, Field #type: ignore
-from typing import Callable, Awaitable
+import requests
+from bs4 import BeautifulSoup
+from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
+
+_DEFAULT_TIMEOUT_SECONDS = 20
+_SUPPORTED_FOCUS = {
+    "all",
+    "web",
+    "news",
+    "wikipedia",
+    "academia",
+    "reddit",
+    "images",
+    "videos",
+}
+_TAG_RE = re.compile(r"<.*?>")
+_WORD_RE = re.compile(r"[a-z0-9]+")
+_SITE_QUERY_HINTS = ("website", "web site", "site", "webpage", "page", "pages")
+_QUERY_STOPWORDS = {
+    "the",
+    "and",
+    "for",
+    "from",
+    "that",
+    "this",
+    "their",
+    "there",
+    "what",
+    "which",
+    "when",
+    "where",
+    "with",
+    "have",
+    "about",
+    "into",
+    "onto",
+    "your",
+    "they",
+    "them",
+    "site",
+    "website",
+    "page",
+    "pages",
+    "web",
+}
+_FRESHNESS_HINTS = {"current", "latest", "recent", "upcoming", "today", "now", "advertising", "advertised"}
+_MONTH_NAMES = (
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+)
 
 
-class Tools:
-    class Valves(BaseModel):
-        BRAVE_SEARCH_KEY: str = Field(
-            default="",
-            description="Brave Search API Key.",
-        )
-
-    def __init__(self):
-        self.valves = self.Valves()
-        self.citation = True
-        os.environ["BRAVE_SEARCH_TOKEN"] = self.valves.BRAVE_SEARCH_KEY
-        os.environ["BRAVE_SEARCH_TOKEN_SECONDARY"] = self.valves.BRAVE_SEARCH_KEY
-
-# ------------------------------------------------------------
-# Helper functions
-# ------------------------------------------------------------
+def _normalize_url(url: str) -> str:
+    parsed = urlparse(url)
+    path = parsed.path or "/"
+    if path != "/" and path.endswith("/"):
+        path = path[:-1]
+    return parsed._replace(fragment="", query="", path=path).geturl()
 
 
-def remove_html_tags(text):
-    """
-    Remove HTML tags from a string.
-
-    Args:
-        text (str): Input text possibly containing HTML tags.
-
-    Returns:
-        str: Text with HTML tags removed.
-    """
-    clean = re.compile("<.*?>")
-    return re.sub(clean, "", text)
+def _tokenize(text: str) -> list[str]:
+    return _WORD_RE.findall((text or "").lower())
 
 
-def decode_data(data):
-    """
-    Extract relevant information from the search API response.
+def _query_terms(query: str) -> set[str]:
+    return {term for term in _tokenize(query) if len(term) > 2 and term not in _QUERY_STOPWORDS}
 
-    Args:
-        data (dict): Response data from the search API.
 
-    Returns:
-        list: List of dictionaries containing the extracted information.
-    """
-    results = []
+def _looks_like_site_content_query(query: str) -> bool:
+    lowered = (query or "").lower()
+    return any(term in lowered for term in _SITE_QUERY_HINTS)
 
-    print(data)
 
-    # with open("data.json", "w") as f:
-    #    json.dump(data, f, indent=2)
+def _same_domain(left: str, right: str) -> bool:
+    return urlparse(left).netloc.lower() == urlparse(right).netloc.lower()
 
-    # link = save_to_s3(data)
-    ##print("Saved search results to: " + link)
 
-    try:
-        try:
-            # #print if there are no infobox results
-            if not data["infobox"]["results"]:
-                print("No infobox results...")
-            else:
-                print("Infobox results found...")
-                # print(data["infobox"]["results"])
-            for result in data.get("infobox", {}).get("results", []):
-                url = result.get("url", "could not find url")
-                description = remove_html_tags(result.get("description", "") or "")
-                long_desc = remove_html_tags(result.get("long_desc", "") or "")
-                attributes = result.get("attributes", [])
+def _is_root_page(url: str) -> bool:
+    path = (urlparse(url).path or "/").strip()
+    return path in {"", "/"}
 
-                attributes_dict = {
-                    attr[0]: remove_html_tags(attr[1] or "") for attr in attributes
-                }
 
-                result_entry = {
-                    "type": "infobox",
-                    "description": description,
-                    "url": url,
-                    "long_desc": long_desc,
-                    "attributes": attributes_dict,
-                }
+def _fetch_html(url: str) -> str | None:
+    response = requests.get(
+        url,
+        headers={"User-Agent": "AstroLlama/1.0 (+websearch)"},
+        timeout=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return getattr(response, "text", None)
 
-                results.append(result_entry)
-        except Exception as e:
-            print("Error in parsing infobox results...")
-            print(str(e))
 
-        try:
-            for i, result in enumerate(data["web"]["results"]):
-                if i >= 8:
-                    break
-                url = result.get("profile", {}).get("url") or result.get("url") or ""
-                title = remove_html_tags(result.get("title") or "")
-                age = result.get("age") or ""
-                description = remove_html_tags(result.get("description") or "")
+def _score_candidate_target(text: str, query_terms: set[str]) -> int:
+    lowered = (text or "").lower()
+    score = sum(3 for term in query_terms if term in lowered)
+    score += sum(2 for term in _FRESHNESS_HINTS if term in lowered)
+    return score
 
-                deep_results = []
-                for snippet in result.get("extra_snippets") or []:
-                    cleaned_snippet = remove_html_tags(snippet)
-                    deep_results.append(cleaned_snippet)
 
-                result_entry = {
-                    "type": "web",
-                    "title": title,  # Corrected here
-                    "age": age,
-                    "description": description,
-                    "url": url,
-                }
+def _extract_candidate_urls(base_url: str, html: str, query: str) -> list[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    query_terms = _query_terms(query)
+    scored_urls: list[tuple[int, str]] = []
+    seen: set[str] = set()
 
-                if result.get("article"):
-                    article = result["article"] or {}
-                    result_entry["author"] = article.get("author") or ""
-                    result_entry["published"] = article.get("date") or ""
-                    result_entry["publisher_type"] = (
-                        article.get("publisher", {}).get("type") or ""
-                    )
-                    result_entry["publisher_name"] = (
-                        article.get("publisher", {}).get("name") or ""
-                    )
+    for anchor in soup.find_all("a", href=True):
+        href = str(anchor.get("href") or "").strip()
+        if not href or href.startswith(("#", "mailto:", "javascript:")):
+            continue
+        absolute = _normalize_url(urljoin(base_url, href))
+        if not absolute.startswith(("http://", "https://")):
+            continue
+        if not _same_domain(base_url, absolute):
+            continue
+        anchor_text = _clean_text(anchor.get_text(" ", strip=True))
+        nav_bonus = 0
+        parent_names = [parent.name for parent in anchor.parents if getattr(parent, "name", None)]
+        if any(name in {"nav", "header", "menu", "aside"} for name in parent_names[:4]):
+            nav_bonus += 4
+        path = urlparse(absolute).path.strip("/")
+        if path and "/" not in path:
+            nav_bonus += 2
+        score = nav_bonus + _score_candidate_target(f"{absolute} {anchor_text}", query_terms)
+        if absolute in seen:
+            continue
+        seen.add(absolute)
+        scored_urls.append((score, absolute))
 
-                if deep_results:
-                    result_entry["deep_results"] = deep_results
+    scored_urls.sort(key=lambda item: (-item[0], len(item[1])))
+    return [url for _, url in scored_urls[:6]]
 
-                # print(result_entry)
 
-                results.append(result_entry)
-        except Exception as e:
-            print("Error in parsing web results...")
-            print(str(e))
+def _extract_page_summary(html: str, query: str) -> tuple[str, list[str], str]:
+    soup = BeautifulSoup(html, "html.parser")
+    query_terms = _query_terms(query)
+    candidates: list[tuple[int, str]] = []
+    seen_lines: set[str] = set()
+    page_title = _clean_text(soup.title.string if soup.title and soup.title.string else "")
 
-        try:
-            for result in data["news"]["results"]:
-                url = result.get("profile", {}).get(
-                    "url", result.get("url", "could not find url")
-                )
-                description = remove_html_tags(result.get("description", ""))
-                title = remove_html_tags(result.get("title", "Could not find title"))
-                age = result.get("age", "Could not find age")
+    meta_desc = soup.find("meta", attrs={"name": re.compile("description", re.IGNORECASE)})
+    meta_text = _clean_text(meta_desc.get("content")) if meta_desc and meta_desc.get("content") else ""
+    if meta_text:
+        candidates.append((max(1, _score_candidate_target(meta_text, query_terms)), meta_text))
 
-                deep_results = []
-                for snippet in result.get("extra_snippets", []):
-                    cleaned_snippet = remove_html_tags(snippet)
-                    deep_results.append({"snippets": cleaned_snippet})
+    for tag in soup.find_all(["h1", "h2", "h3", "li", "p"]):
+        line = _clean_text(tag.get_text(" ", strip=True))
+        if len(line) < 20 or len(line) > 260:
+            continue
+        normalized = line.lower()
+        if normalized in seen_lines:
+            continue
+        seen_lines.add(normalized)
+        score = _score_candidate_target(line, query_terms)
+        score += sum(2 for month in _MONTH_NAMES if month in normalized)
+        score += 2 if re.search(r"\b\d{1,2}(?::\d{2})?\s*(am|pm)\b", normalized) else 0
+        score += 2 if re.search(r"\b20\d{2}\b", normalized) else 0
+        if tag.name in {"h1", "h2", "h3"}:
+            score += 1
+        if score <= 0 and len(candidates) >= 6:
+            continue
+        candidates.append((score, line))
 
-                result_entry = {
-                    "type": "news",
-                    "title": title,  # Corrected here
-                    "age": age,
-                    "description": description,
-                    "url": url,
-                }
+    candidates.sort(key=lambda item: (-item[0], len(item[1])))
+    top_lines = [line for _, line in candidates[:5] if line]
+    if not top_lines:
+        fallback_lines = []
+        for tag in soup.find_all(["h1", "h2", "p"], limit=4):
+            line = _clean_text(tag.get_text(" ", strip=True))
+            if len(line) >= 20 and line not in fallback_lines:
+                fallback_lines.append(line)
+        top_lines = fallback_lines
+    return (" ".join(top_lines), top_lines, page_title)
 
-                if deep_results:
-                    result_entry["deep_results"] = deep_results
 
-                results.append(result_entry)
-        except Exception as e:
-            print("Error in parsing news results...")
-            print(str(e))
+def _select_best_candidate(candidate_pages: list[dict[str, Any]], query: str) -> dict[str, Any]:
+    best = candidate_pages[0]
+    if not _is_root_page(str(best.get("url") or "")):
+        return best
 
-        try:
-            for i, result in enumerate(data["videos"]["results"]):
-                if i >= 4:
-                    break
-                url = result.get("profile", {}).get(
-                    "url", result.get("url", "could not find url")
-                )
-                description = remove_html_tags(result.get("description", ""))
+    query_terms = _query_terms(query)
+    if not query_terms:
+        return best
 
-                deep_results = []
-                for snippet in result.get("extra_snippets", []):
-                    cleaned_snippet = remove_html_tags(snippet)
-                    deep_results.append({"snippets": cleaned_snippet})
+    for candidate in candidate_pages[1:]:
+        candidate_url = str(candidate.get("url") or "")
+        if _is_root_page(candidate_url):
+            continue
+        # Prefer a deeper page when it's close in quality to homepage content.
+        if int(candidate.get("score") or 0) >= int(best.get("score") or 0) - 3:
+            return candidate
+    return best
 
-                result_entry = {
-                    "type": "videos",
-                    "description": description,
-                    "url": url,
-                }
 
-                if deep_results:
-                    result_entry["deep_results"] = deep_results
-
-                results.append(result_entry)
-        except Exception as e:
-            print("Error in parsing video results...")
-            print(str(e))
-
+def _enrich_site_content_results(query: str, results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not _looks_like_site_content_query(query):
         return results
 
-    except Exception as e:
-        print(str(e))
-        return ["No search results from Brave (or an error occurred)..."]
+    enriched_results = [dict(item) for item in results]
+    for index, item in enumerate(enriched_results):
+        if item.get("type") != "web":
+            continue
+        url = str(item.get("url") or "").strip()
+        if not url:
+            continue
+        try:
+            homepage_html = _fetch_html(url)
+            if not homepage_html:
+                continue
+            candidate_urls = [url]
+            candidate_urls.extend(_extract_candidate_urls(url, homepage_html, query))
+            seen_candidates: set[str] = set()
+            candidate_pages: list[dict[str, Any]] = []
+            for candidate_url in candidate_urls[:5]:
+                normalized_candidate = _normalize_url(candidate_url)
+                if normalized_candidate in seen_candidates:
+                    continue
+                seen_candidates.add(normalized_candidate)
+                try:
+                    candidate_html = homepage_html if normalized_candidate == _normalize_url(url) else _fetch_html(candidate_url)
+                except requests.RequestException:
+                    continue
+                if not candidate_html:
+                    continue
+                summary_text, summary_lines, page_title = _extract_page_summary(candidate_html, query)
+                if not summary_lines:
+                    continue
+                score = _score_candidate_target(f"{normalized_candidate} {page_title} {summary_text}", _query_terms(query))
+                score += len(summary_lines) * 2
+                if normalized_candidate != _normalize_url(url):
+                    score += 1
+                candidate_pages.append(
+                    {
+                        "score": score,
+                        "url": normalized_candidate,
+                        "title": page_title,
+                        "summary": summary_text,
+                        "summary_lines": summary_lines,
+                    }
+                )
+            candidate_pages.sort(key=lambda candidate: (-candidate["score"], len(candidate["url"])))
+            if candidate_pages:
+                best_match = _select_best_candidate(candidate_pages, query)
+                item["matched_page_url"] = best_match["url"]
+                if best_match.get("title"):
+                    item["matched_page_title"] = best_match["title"]
+                item["site_summary"] = best_match["summary"]
+                item["site_summary_lines"] = best_match["summary_lines"]
+                item["site_candidates"] = candidate_pages[:3]
+                item["crawl_strategy"] = "same-domain candidate page crawl"
+                enriched_results[index] = item
+                break
+        except requests.RequestException as exc:
+            logger.debug("Site content enrichment failed for %s: %s", url, exc)
+
+    return enriched_results
 
 
-def search_brave(query, country, language, focus, SEARCH_KEY):
-    """
-    Search using the Brave Search API.
+def _clean_text(text: str | None) -> str:
+    return _TAG_RE.sub("", unescape(str(text or ""))).strip()
 
-    Args:
-        query (str): Search query.
-        country (str): Two-letter country code.
-        freshness (str): Filter search results by freshness (e.g., '24h', 'week', 'month', 'year', 'all').
-        focus (str): Focus the search on specific types of results (e.g., 'web', 'news', 'reddit', 'video', 'all').
 
-    Returns:
-        list: List of dictionaries containing search results.
-    """
-    results_filter = "infobox"
-    if focus == "web" or focus == "all":
-        results_filter += ",web"
-    if focus == "news" or focus == "all":
-        results_filter += ",news"
-    if focus == "video":
-        results_filter += ",videos"
+def _decode_web_payload(data: dict[str, Any]) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
 
-    # Handle focuses that use goggles
-    goggles_id = ""
-    if focus == "reddit":
-        query = "site:reddit.com " + query
-    elif focus == "academia":
-        goggles_id = "&goggles_id=https://raw.githubusercontent.com/solso/goggles/main/academic_papers_search.goggle"
-    elif focus == "wikipedia":
-        query = "site:wikipedia.org " + query
+    for result in data.get("infobox", {}).get("results", []):
+        attributes = result.get("attributes") or []
+        results.append(
+            {
+                "type": "infobox",
+                "url": result.get("url") or "",
+                "description": _clean_text(result.get("description")),
+                "long_desc": _clean_text(result.get("long_desc")),
+                "attributes": {
+                    str(attr[0]): _clean_text(attr[1])
+                    for attr in attributes
+                    if isinstance(attr, (list, tuple)) and len(attr) >= 2
+                },
+            }
+        )
 
-    encoded_query = urllib.parse.quote(query)
-    url = (
-        f"https://api.search.brave.com/res/v1/web/search?q={encoded_query}&results_filter={results_filter}&country={country}&search_lang=en&text_decorations=no&extra_snippets=true&count=20"
-        + goggles_id
-    )
+    for result in (data.get("web", {}).get("results") or [])[:8]:
+        item = {
+            "type": "web",
+            "title": _clean_text(result.get("title")),
+            "age": result.get("age") or "",
+            "description": _clean_text(result.get("description")),
+            "url": (result.get("profile") or {}).get("url") or result.get("url") or "",
+        }
+        article = result.get("article") or {}
+        if article:
+            item.update(
+                {
+                    "author": article.get("author") or "",
+                    "published": article.get("date") or "",
+                    "publisher_type": ((article.get("publisher") or {}).get("type") or ""),
+                    "publisher_name": ((article.get("publisher") or {}).get("name") or ""),
+                }
+            )
+        snippets = [_clean_text(snippet) for snippet in (result.get("extra_snippets") or [])]
+        snippets = [snippet for snippet in snippets if snippet]
+        if snippets:
+            item["deep_results"] = snippets
+        results.append(item)
 
-    # print(url)
+    for result in data.get("news", {}).get("results") or []:
+        item = {
+            "type": "news",
+            "title": _clean_text(result.get("title")),
+            "age": result.get("age") or "",
+            "description": _clean_text(result.get("description")),
+            "url": (result.get("profile") or {}).get("url") or result.get("url") or "",
+        }
+        snippets = [_clean_text(snippet) for snippet in (result.get("extra_snippets") or [])]
+        snippets = [snippet for snippet in snippets if snippet]
+        if snippets:
+            item["deep_results"] = snippets
+        results.append(item)
 
-    headers = {
-        "Accept": "application/json",
-        "Accept-Encoding": "gzip",
-        "X-Subscription-Token": SEARCH_KEY,
-    }
+    for result in (data.get("videos", {}).get("results") or [])[:4]:
+        item = {
+            "type": "videos",
+            "description": _clean_text(result.get("description")),
+            "url": (result.get("profile") or {}).get("url") or result.get("url") or "",
+        }
+        snippets = [_clean_text(snippet) for snippet in (result.get("extra_snippets") or [])]
+        snippets = [snippet for snippet in snippets if snippet]
+        if snippets:
+            item["deep_results"] = snippets
+        results.append(item)
 
-    try:
-        start_search = time.time()
-        # print("Getting brave search results...")
-        response = requests.get(url, headers=headers)
-        data = response.json()
-        end_search = time.time()
-        # print("Brave search took: " + str(end_search - start_search) + " seconds")
-    except Exception as e:
-        # print("Error fetching search results...")
-        # print(e)
-        return {"statusCode": 400, "body": json.dumps("Error fetching search results.")}
-
-    results = decode_data(data)
     return results
 
 
-def search_images_and_video(query, country, type, freshness=None, SEARCH_KEY=None):
-    encoded_query = urllib.parse.quote(query)
-    url = f"https://api.search.brave.com/res/v1/{type}/search?q={encoded_query}&country={country}&search_lang=en&count=10"
+def _decode_image_payload(data: dict[str, Any]) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for result in data.get("results") or []:
+        image_props = result.get("properties") or {}
+        results.append(
+            {
+                "type": "image",
+                "title": _clean_text(result.get("title")),
+                "url": result.get("url") or "",
+                "page_fetched": result.get("page_fetched") or "",
+                "image_url": image_props.get("url") or "",
+            }
+        )
+    return results
 
-    if (
-        freshness != None
-        and freshness in ["24h", "week", "month", "year"]
-        and type == "videos"
-    ):
-        # Map freshness to ["pd", "pw", "pm", "py"] / No freshness for "all"
-        freshness_map = {
-            "24h": "pd",
-            "week": "pw",
-            "month": "pm",
-            "year": "py",
-        }
 
-        freshness = freshness_map[freshness]
+def _build_query(query: str, focus: str) -> tuple[str, str]:
+    goggles_id = ""
+    effective_query = query.strip()
 
-        url += f"&freshness={freshness}"
+    if focus == "reddit":
+        effective_query = f"site:reddit.com {effective_query}".strip()
+    elif focus == "academia":
+        goggles_id = (
+            "&goggles_id=https://raw.githubusercontent.com/solso/goggles/main/"
+            "academic_papers_search.goggle"
+        )
+    elif focus == "wikipedia":
+        effective_query = f"site:wikipedia.org {effective_query}".strip()
 
-    # print(url)
+    return effective_query, goggles_id
 
+
+def _search_brave_web(
+    query: str,
+    country: str,
+    language: str,
+    focus: str,
+    search_key: str,
+) -> list[dict[str, Any]]:
+    results_filter = ["infobox"]
+    if focus in {"all", "web", "reddit", "academia", "wikipedia"}:
+        results_filter.append("web")
+    if focus in {"all", "news"}:
+        results_filter.append("news")
+    if focus == "videos":
+        results_filter.append("videos")
+
+    effective_query, goggles_id = _build_query(query, focus)
+    url = (
+        "https://api.search.brave.com/res/v1/web/search"
+        f"?q={quote(effective_query)}"
+        f"&results_filter={','.join(results_filter)}"
+        f"&country={country}"
+        f"&search_lang={language}"
+        "&text_decorations=no&extra_snippets=true&count=20"
+        f"{goggles_id}"
+    )
     headers = {
         "Accept": "application/json",
         "Accept-Encoding": "gzip",
-        "X-Subscription-Token": SEARCH_KEY,
+        "X-Subscription-Token": search_key,
     }
 
-    try:
-        response = requests.get(url, headers=headers)
-        data = response.json()
-        # return data
-        ##print(json.dumps(data, indent=2))
-
-        # link = save_to_s3(data)
-        ##print("Saved image results to: " + link)
-
-        if type == "images":
-            formatted_data = {}
-            for i, result in enumerate(data["results"], start=1):
-                # print(result)
-                formatted_data[f"image{i}"] = {
-                    "source": result["url"],
-                    "page_fetched": result["page_fetched"],
-                    "title": result["title"],
-                    "image_url": result["properties"]["url"],
-                }
-
-            return formatted_data
-        else:
-            return data
-    except Exception as e:
-        # print(e)
-        return {"statusCode": 400, "body": json.dumps("Error fetching image results.")}
+    response = requests.get(url, headers=headers, timeout=_DEFAULT_TIMEOUT_SECONDS)
+    response.raise_for_status()
+    return _decode_web_payload(response.json())
 
 
-# ------------------------------------------------------------
-# Primary Function
-# ------------------------------------------------------------
+def _search_brave_media(
+    query: str,
+    country: str,
+    language: str,
+    focus: Literal["images", "videos"],
+    search_key: str,
+) -> list[dict[str, Any]]:
+    url = (
+        f"https://api.search.brave.com/res/v1/{focus}/search"
+        f"?q={quote(query.strip())}&country={country}&search_lang={language}&count=10"
+    )
+    headers = {
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip",
+        "X-Subscription-Token": search_key,
+    }
+
+    response = requests.get(url, headers=headers, timeout=_DEFAULT_TIMEOUT_SECONDS)
+    response.raise_for_status()
+    data = response.json()
+    if focus == "images":
+        return _decode_image_payload(data)
+    return _decode_web_payload({"videos": data})
 
 
-def searchWeb(
+def search_web_sync(
     query: str,
     country: str = "US",
     language: str = "en",
     focus: str = "all",
-    SEARCH_KEY=None,
-):
-    """
-    Search the web for the given query.
+    search_key: str = "",
+) -> list[dict[str, Any]] | dict[str, str]:
+    normalized_query = str(query or "").strip()
+    if not normalized_query:
+        return {"error": "Query must not be empty."}
 
-    Parameters:
-    query (str): The query to search for.
-    country (str): The country to search from.
-    language (str): The language to search in.
-    focus (str): The type of search to perform.
+    normalized_focus = (focus or "all").strip().lower()
+    if normalized_focus not in _SUPPORTED_FOCUS:
+        normalized_focus = "all"
 
-    Returns:
-    dict: The search results.
-    """
-
-    if focus not in [
-        "all",
-        "web",
-        "news",
-        "wikipedia",
-        "academia",
-        "reddit",
-        "images",
-        "videos",
-    ]:
-        focus = "all"
+    resolved_key = str(search_key or os.environ.get("BRAVE_SEARCH_TOKEN") or "").strip()
+    if not resolved_key:
+        return {"error": "Brave Search API key is not configured."}
 
     try:
-        if focus not in ["images", "video"]:
-            results = search_brave(query, country, language, focus, SEARCH_KEY)
-        else:
-            results = search_images_and_video(query, country, focus, SEARCH_KEY)
-    except Exception as e:
-        # print(e)
-        return {"statusCode": 400, "body": json.dumps("Error fetching search results.")}
-
-    return results
+        if normalized_focus in {"images", "videos"}:
+            return _search_brave_media(
+                query=normalized_query,
+                country=country,
+                language=language,
+                focus=normalized_focus,
+                search_key=resolved_key,
+            )
+        return _search_brave_web(
+            query=normalized_query,
+            country=country,
+            language=language,
+            focus=normalized_focus,
+            search_key=resolved_key,
+        )
+    except requests.HTTPError as exc:
+        status_code = exc.response.status_code if exc.response is not None else "unknown"
+        logger.warning("Brave search HTTP error (%s): %s", status_code, exc)
+        return {"error": f"Brave Search request failed with status {status_code}."}
+    except requests.RequestException as exc:
+        logger.warning("Brave search request error: %s", exc)
+        return {"error": "Failed to reach Brave Search."}
+    except Exception as exc:
+        logger.exception("Unexpected Brave search failure")
+        return {"error": f"Unexpected search failure: {exc}"}
 
 
 class Tools:
     class Valves(BaseModel):
-        SEARCH_KEY: str = Field(
-            default="",
-            description="Brave Search API Key",
-        )
+        SEARCH_KEY: str = Field(default="", description="Brave Search API Key")
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.valves = self.Valves()
         self.citation = True
 
     async def search_web(
-        self, query: str, country: str = "US", language: str = "en", focus: str = "all"
-    ):
-        """
-        Search the web for the given query.
-        :param query: The query to search for. Should be a string and optimized for search engines.
-        :param country: The country to search from. Two letter country code.
-        :param language: The language to search in. Language code like en, fr, de, etc.
-        :param focus: The type of search to perform. Can be "all", "web", "news", "wikipedia", "academia", "reddit", "images", "videos".
-        :return: The search results.
-        """
+        self,
+        query: str,
+        country: str = "US",
+        language: str = "en",
+        focus: str = "all",
+    ) -> str:
+        """Search the web for the given query.
 
-        results = searchWeb(query, country, language, focus, self.valves.SEARCH_KEY)
-        print(results)
+        :param query: Search query to send to Brave Search.
+        :param country: Two-letter country code for regional search behavior.
+        :param language: Language code such as en, fr, or de.
+        :param focus: Search focus: all, web, news, wikipedia, academia, reddit, images, or videos.
+        :returns: JSON string containing normalized search results or an error payload.
+        """
+        results = search_web_sync(
+            query=query,
+            country=country,
+            language=language,
+            focus=focus,
+            search_key=self.valves.SEARCH_KEY,
+        )
+        if isinstance(results, list):
+            results = _enrich_site_content_results(query, results)
         return json.dumps(results)

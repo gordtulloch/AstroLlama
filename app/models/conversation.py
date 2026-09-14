@@ -16,6 +16,7 @@ class ConversationSettings(BaseModel):
     temperature: float = 0.7
     top_p: float = 0.9
     max_tokens: int = 1024
+    hide_tool_bubbles: bool = False
 
 
 class Message(BaseModel):

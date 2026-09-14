@@ -9,10 +9,12 @@ from app.config import settings as _app_settings
 
 class ChatSettings(BaseModel):
     system_prompt: Optional[str] = None
-    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
+    temperature: float = Field(default=0.6, ge=0.0, le=2.0)
     top_p: float = Field(default=0.9, ge=0.0, le=1.0)
     max_tokens: int = Field(default=1024, ge=1, le=32768)
+    repetition_penalty: float = Field(default=1.5, ge=1.0, le=2.0)
     context_size: int = Field(default_factory=lambda: _app_settings.default_context_size, ge=512)
+    hide_tool_bubbles: bool = False
 
 
 class ChatRequest(BaseModel):

@@ -30,6 +30,7 @@ import html as _html_module
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from urllib.parse import quote, urljoin, urlparse
 from typing import Any, Optional, Callable, Awaitable
 
 from pydantic import BaseModel, Field
@@ -362,6 +363,57 @@ def _strip_html(raw: str) -> str:
     return " ".join(raw.split()).strip()
 
 
+def _extract_topic_keyword(query: str) -> str:
+    q = (query or "").strip()
+    if not q:
+        return ""
+
+    # Prefer explicit topic phrases (e.g., "news about canada", "what's happening with x").
+    m = re.search(
+        r"\b(?:news\s+about|about|on|regarding|with)\s+(.+)$", q, re.I
+    )
+    if m:
+        topic = m.group(1)
+    else:
+        topic = q
+
+    topic = re.sub(r"[?!.]+$", "", topic).strip()
+    topic = re.sub(r"\b(?:news|headlines|latest|today|top|happening)\b", " ", topic, flags=re.I)
+    topic = re.sub(r"\s+", " ", topic).strip(" ,.-")
+
+    # Avoid returning pure category keywords as a topical filter.
+    low = topic.lower()
+    if not topic or len(low) < 3:
+        return ""
+    if _detect_category(low) != _FALLBACK_CAT and len(low.split()) <= 2:
+        return ""
+    return topic
+
+
+def _article_matches_topic(article: dict, topic: str) -> bool:
+    t = (topic or "").strip().lower()
+    if not t:
+        return True
+
+    title = (article.get("title") or "").lower()
+    summary = (article.get("summary") or "").lower()
+    source = (article.get("source") or "").lower()
+    haystack = f"{title} {summary} {source}"
+
+    # Exact phrase match is preferred for strict topical relevance.
+    if t in haystack:
+        return True
+
+    terms = [
+        w
+        for w in re.findall(r"[a-z0-9]+", t)
+        if len(w) >= 3 and w not in {"news", "latest", "today", "headlines"}
+    ]
+    if not terms:
+        return False
+    return all(term in haystack for term in terms)
+
+
 def _age_str(pub_date: str) -> str:
     if not pub_date:
         return ""
@@ -440,14 +492,80 @@ async def _fetch_feed(
     kw_low = keyword.strip().lower()
     articles = []
 
+    def _normalize_url(url: str) -> str:
+        u = _html_module.unescape((url or "").strip()).strip("<>")
+        if not u:
+            return ""
+        if u.startswith("//"):
+            u = f"https:{u}"
+        # Handle relative URLs some feeds emit.
+        u = urljoin(feed.get("url", ""), u)
+        parsed = urlparse(u)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return ""
+        return u
+
+    def _rss_link(item_el: ET.Element) -> str:
+        candidates = []
+
+        link_text = (item_el.findtext("link") or "").strip()
+        if link_text:
+            candidates.append(link_text)
+
+        link_el = item_el.find("link")
+        if link_el is not None:
+            href = (link_el.get("href") or "").strip()
+            if href:
+                candidates.append(href)
+
+        guid_text = (item_el.findtext("guid") or "").strip()
+        guid_el = item_el.find("guid")
+        if guid_text and guid_el is not None:
+            is_permalink = (guid_el.get("isPermaLink", "true") or "true").lower()
+            if is_permalink in {"true", "1", "yes"}:
+                candidates.append(guid_text)
+
+        for c in candidates:
+            normalized = _normalize_url(c)
+            if normalized:
+                return normalized
+        return ""
+
+    def _atom_link(item_el: ET.Element) -> str:
+        links = item_el.findall(f"{{{ns_atom}}}link")
+        candidates = []
+
+        # Prefer the canonical article link.
+        for rel_pref in ("alternate", ""):
+            for l in links:
+                rel = (l.get("rel") or "").strip().lower()
+                href = (l.get("href") or "").strip()
+                if not href:
+                    continue
+                if rel_pref == "alternate" and rel != "alternate":
+                    continue
+                if rel_pref == "" and rel not in {"", "alternate"}:
+                    continue
+                candidates.append(href)
+
+        # Fallback to id if it's a URL.
+        id_text = (item_el.findtext(f"{{{ns_atom}}}id") or "").strip()
+        if id_text:
+            candidates.append(id_text)
+
+        for c in candidates:
+            normalized = _normalize_url(c)
+            if normalized:
+                return normalized
+        return ""
+
     for item in raw_items:
         if len(articles) >= limit:
             break
 
         if is_atom:
             title = (item.findtext(f"{{{ns_atom}}}title") or "").strip()
-            link_el = item.find(f"{{{ns_atom}}}link")
-            link = link_el.get("href", "") if link_el is not None else ""
+            link = _atom_link(item)
             body_raw = (
                 item.findtext(f"{{{ns_atom}}}content")
                 or item.findtext(f"{{{ns_atom}}}summary")
@@ -460,11 +578,7 @@ async def _fetch_feed(
             )
         else:
             title = (item.findtext("title") or "").strip()
-            link = (item.findtext("link") or "").strip()
-            if not link:
-                lel = item.find("link")
-                if lel is not None and lel.tail:
-                    link = lel.tail.strip()
+            link = _rss_link(item)
             body_raw = (
                 item.findtext(f"{{{ns_content}}}encoded")
                 or item.findtext("description")
@@ -477,7 +591,12 @@ async def _fetch_feed(
 
         if not title or not link:
             continue
-        if kw_low and kw_low not in title.lower() and kw_low not in summary.lower():
+        if (
+            kw_low
+            and kw_low not in title.lower()
+            and kw_low not in summary.lower()
+            and kw_low not in feed["name"].lower()
+        ):
             continue
 
         articles.append(
@@ -900,6 +1019,17 @@ class Tools:
     def _limit(self) -> int:
         return max(5, min(40, self.valves.MAX_ARTICLES))
 
+    @staticmethod
+    def _unique_feeds() -> list:
+        all_feeds = [f for feeds in FEEDS.values() for f in feeds]
+        seen: set = set()
+        unique = []
+        for f in all_feeds:
+            if f["url"] not in seen:
+                seen.add(f["url"])
+                unique.append(f)
+        return unique
+
     # ── Tool 1: get_news — auto-routes by category keyword ───────────────────
 
     async def get_news(
@@ -923,7 +1053,17 @@ class Tools:
         await _emit(__event_emitter__, f"{icon} Fetching {label} news…")
 
         lim = self._limit()
-        articles = await _fetch_many(feeds, limit_per_feed=8, total_limit=lim)
+        topic_keyword = _extract_topic_keyword(query)
+        if topic_keyword:
+            articles = await _fetch_many(
+                self._unique_feeds(),
+                limit_per_feed=5,
+                total_limit=lim,
+                keyword=topic_keyword,
+            )
+            articles = [a for a in articles if _article_matches_topic(a, topic_keyword)]
+        else:
+            articles = await _fetch_many(feeds, limit_per_feed=8, total_limit=lim)
 
         if not articles:
             await _emit(__event_emitter__, "❌ No articles retrieved", done=True)
@@ -980,7 +1120,7 @@ class Tools:
         self,
         keyword: str,
         __event_emitter__: Optional[Callable[[Any], Awaitable[None]]] = None,
-    ) -> "HTMLResponse | str":
+    ) -> str:
         """
         Search for news articles containing a specific keyword or phrase across all 45 feeds.
         Use for: "news about [topic]", "articles about [person/event/company]".
@@ -991,18 +1131,13 @@ class Tools:
 
         await _emit(__event_emitter__, f"🔎 Searching all feeds for '{keyword}'…")
 
-        all_feeds = [f for feeds in FEEDS.values() for f in feeds]
-        seen: set = set()
-        unique = []
-        for f in all_feeds:
-            if f["url"] not in seen:
-                seen.add(f["url"])
-                unique.append(f)
+        unique = self._unique_feeds()
 
         lim = self._limit()
         articles = await _fetch_many(
-            unique, limit_per_feed=5, total_limit=lim, keyword=keyword.strip()
+            unique, limit_per_feed=6, total_limit=lim, keyword=keyword.strip()
         )
+        articles = [a for a in articles if _article_matches_topic(a, keyword.strip())]
 
         if not articles:
             await _emit(__event_emitter__, f"No results for '{keyword}'", done=True)
@@ -1011,13 +1146,35 @@ class Tools:
                 "Try a broader term, or check back as feeds refresh."
             )
 
-        sources = list(dict.fromkeys(a["source"] for a in articles))
-        html = _build_news_html(articles, f'News: "{keyword}"', "world", sources)
+        top = articles[:lim]
+        lines = [
+            f'Here are up to {lim} news items matching "{keyword}":',
+            "",
+        ]
+        for i, art in enumerate(top, 1):
+            title = art.get("title", "Unknown Title").replace("[", r"\[").replace("]", r"\]")
+            link = art.get("link", "")
+            source = art.get("source", "Unknown Source")
+            age = art.get("age", "")
+            summarize_link = (
+                "astrollama://summarize?"
+                f"title={quote(art.get('title', 'Unknown Title'))}"
+                f"&article_url={quote(link)}"
+                f"&source={quote(source)}"
+            )
+            if link:
+                lines.append(f"{i}. [{title}]({link}) - [Summarize]({summarize_link})")
+            else:
+                lines.append(f"{i}. {title}")
+            meta = f"   {source}"
+            if age:
+                meta += f" | {age}"
+            lines.append(meta)
 
         await _emit(
-            __event_emitter__, f"✅ {len(articles)} results for '{keyword}'", done=True
+            __event_emitter__, f"✅ {len(top)} of {len(articles)} results for '{keyword}'", done=True
         )
-        return HTMLResponse(content=html, headers={"content-disposition": "inline"})
+        return "\n".join(lines)
 
     # ── Tool 4: summarize_news — FETCHES real article text for LLM to read ───
 
@@ -1027,67 +1184,123 @@ class Tools:
         __event_emitter__: Optional[Callable[[Any], Awaitable[None]]] = None,
     ) -> str:
         """
-        Fetch the latest news articles for a topic AND retrieve the actual full text of each
-        article so the AI can write a real, detailed summary — not just a headline list.
-        Use when the user asks to SUMMARIZE, EXPLAIN, BRIEF, or RECAP recent news on any topic.
-        Examples: "summarize the latest AI news", "brief me on tech news today",
-        "what's happening with the Israel war", "give me a news summary about climate",
-        "summarize US politics today", "what's going on with [topic]".
-        :param query: Topic or category to summarize, e.g. "AI news", "Israel conflict", "tech today"
+        Fetch NEWS ARTICLES ONLY and retrieve full text so the AI can write detailed summaries.
+        
+        Use ONLY when the user asks to summarize NEWS or current events.
+        NEVER use for arXiv papers, academic content, or non-news topics.
+        
+        Examples of CORRECT use:
+        - "summarize the latest AI news"
+        - "brief me on tech news today"
+        - "what's happening with climate change in the news"
+        - "news summary about US politics"
+        
+        Examples of INCORRECT use (do NOT call):
+        - Summarizing arXiv papers (use the result from load_paper_html_text directly)
+        - Summarizing academic content
+        - Summarizing any non-news topics
+        
+        :param query: News topic to summarize (e.g. "AI news", "climate change", "tech today")
         """
         cat = _detect_category(query)
         feeds = FEEDS.get(cat, FEEDS["world"])
         label = cat.title()
+        topic_keyword = _extract_topic_keyword(query)
 
         await _emit(__event_emitter__, f"🔍 Fetching {label} headlines…")
 
         # Step 1: get RSS articles (fewer items, richer content needed)
-        articles = await _fetch_many(feeds, limit_per_feed=5, total_limit=8)
+        if topic_keyword:
+            articles = await _fetch_many(
+                self._unique_feeds(),
+                limit_per_feed=5,
+                total_limit=8,
+                keyword=topic_keyword,
+            )
+            articles = [a for a in articles if _article_matches_topic(a, topic_keyword)]
+        else:
+            articles = await _fetch_many(feeds, limit_per_feed=5, total_limit=8)
 
         if not articles:
             await _emit(__event_emitter__, "❌ No articles", done=True)
             return f"❌ Could not retrieve {label} news right now."
 
-        # Step 2: concurrently fetch full article text for up to 6 articles
-        await _emit(__event_emitter__, f"📖 Reading {min(len(articles), 6)} articles…")
+        # Step 2: build arXiv-style numbered output with links.
+        list_topic = topic_keyword or label
+        list_lines = [f"Here are some new items regarding {list_topic}:", ""]
 
-        conn = aiohttp.TCPConnector(ssl=False, limit=6)
-        async with aiohttp.ClientSession(connector=conn) as session:
-            fetch_tasks = [
-                _fetch_article_text(session, a["link"], max_chars=2500)
-                for a in articles[:6]
-            ]
-            texts = await asyncio.gather(*fetch_tasks, return_exceptions=True)
-
-        # Step 3: build a rich context string for the LLM
-        blocks = []
-        for i, (art, body) in enumerate(zip(articles[:6], texts)):
-            if isinstance(body, Exception):
-                body = ""
-            rss_summary = art.get("summary", "")
-            content = body if len(body) > len(rss_summary) else rss_summary
-            content = content[:2000].strip()
-
-            blocks.append(
-                f"--- Article {i+1} ---\n"
-                f"Source:    {art['source']}\n"
-                f"Published: {art.get('age', 'unknown')}\n"
-                f"Title:     {art['title']}\n"
-                f"URL:       {art['link']}\n"
-                f"Content:\n{content}"
+        for i, art in enumerate(articles[:6]):
+            title = art.get("title", "Unknown Title")
+            link = art.get("link", "")
+            source = art.get("source", "Unknown Source")
+            escaped_title = title.replace("[", r"\[").replace("]", r"\]")
+            summarize_link = (
+                "astrollama://summarize?"
+                f"title={quote(title)}"
+                f"&article_url={quote(link)}"
+                f"&source={quote(source)}"
             )
 
-        context = "\n\n".join(blocks)
+            if link:
+                list_lines.append(
+                    f"{i+1}. [{escaped_title}]({link}) - "
+                    f"[Summarize]({summarize_link})"
+                )
+            else:
+                list_lines.append(f"{i+1}. {escaped_title}")
+        listing = "\n".join(list_lines)
 
         await _emit(
             __event_emitter__, f"✅ Ready — summarizing {label} news", done=True
         )
 
-        # Return the raw text so the LLM (caller) uses it to write the summary
+        return listing
+
+    # ── Tool 5: load_news_article_text — fetch one article's text for summary ──
+
+    async def load_news_article_text(
+        self,
+        title: str,
+        article_url: str,
+        __event_emitter__: Optional[Callable[[Any], Awaitable[None]]] = None,
+    ) -> str:
+        """
+        Load full text for a single news article URL so the AI can summarize it.
+        Use this when a user clicks a Summary link from news results.
+        :param title: Article title
+        :param article_url: Direct article URL
+        """
+        t = (title or "").strip() or "Unknown Title"
+        u = (article_url or "").strip()
+        if not u:
+            return "❌ Missing article URL."
+
+        await _emit(__event_emitter__, "📖 Loading full article text…")
+
+        conn = aiohttp.TCPConnector(ssl=False, limit=2)
+        async with aiohttp.ClientSession(connector=conn) as session:
+            text = await _fetch_article_text(session, u, max_chars=9000)
+
+        if not text:
+            await _emit(__event_emitter__, "❌ Could not extract article text", done=True)
+            return f"❌ Could not extract text for '{t}'. URL: {u}"
+
+        if __event_emitter__:
+            await __event_emitter__(
+                {
+                    "type": "citation",
+                    "data": {
+                        "document": [text],
+                        "metadata": [{"source": u}],
+                        "source": {"name": t},
+                    },
+                }
+            )
+
+        await _emit(__event_emitter__, "✅ Article text loaded", done=True)
         return (
-            f"Here is the full content of the {len(blocks)} most recent {label} news articles "
-            f"fetched right now. Use this to write a comprehensive, well-structured summary "
-            f"for the user. Group related stories, highlight the most important developments, "
-            f"and mention sources. Do not just list headlines — write real paragraphs.\n\n"
-            f"{context}"
+            f"Title: {t}\n"
+            f"Article URL: {u}\n"
+            f"Retrieved from: Article page\n\n"
+            f"HTML text for summarization:\n{text}"
         )

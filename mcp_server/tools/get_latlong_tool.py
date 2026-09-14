@@ -16,3 +16,12 @@ class Tools:
         except ImportError:
             from data_sources.open_meteo import fetch_open_meteo_geocode
         return await fetch_open_meteo_geocode(location=location, count=count)
+
+    async def get_lat_long(self, location: str, count: int = 1) -> str:
+        """Alias for get_latlong for compatibility with underscore naming.
+
+        :param location: City or place name to resolve (for example, 'Winnipeg, Manitoba').
+        :param count: Maximum number of candidates to return (1-5).
+        :returns: A formatted geocoding report with coordinates and timezone.
+        """
+        return await self.get_latlong(location=location, count=count)

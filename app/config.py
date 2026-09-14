@@ -20,6 +20,8 @@ class Settings(BaseSettings):
         "If additional context has been provided from the local knowledge base, use it to answer. "
         "Only call a tool when the user explicitly requests a live lookup, a chart, the current weather, "
         "or current time — not simply because the topic is astronomical. "
+        "For explicit latitude/longitude or coordinate requests, call get_lat_long/get_latlong when available and use its output. "
+        "Do not claim lack of database access when a matching tool is available. "
         "Use simbad_lookup_object for one specific object lookup (coordinates/properties of a named object). "
         "Use simbad_search only for multi-result list/browse queries. "
         "Answer concisely. "

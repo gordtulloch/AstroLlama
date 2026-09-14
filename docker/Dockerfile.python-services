@@ -11,12 +11,67 @@ RUN apt-get update \
         build-essential \
         gcc \
         g++ \
+        git \
+        swig \
+        pkg-config \
         curl \
         ca-certificates \
+        file \
+        dbus \
+        libdbus-1-dev \
+        libglib2.0-dev \
+        libindi-dev \
+        libcfitsio-dev \
+        libnova-dev \
+        libglib2.0-0 \
+        libgtk-3-0 \
+        libx11-6 \
+        libxext6 \
+        libxrender1 \
+        libxtst6 \
+        libxi6 \
+        libnss-mdns \
+        patchelf \
     && rm -rf /var/lib/apt/lists/*
 
+# Enable mDNS (.local) resolution via the host's avahi-daemon socket.
+# NSS will try mdns4_minimal first; if the daemon socket is not mounted it
+# falls through to normal DNS without error.
+RUN sed -i 's/^\(hosts:.*\)dns\(.*\)$/\1mdns4_minimal [NOTFOUND=return] dns\2/' /etc/nsswitch.conf
+
+COPY astap/*.deb /tmp/astap/
+
+RUN apt-get update \
+    && dpkg -i /tmp/astap/*.deb \
+    || (apt-get -f install -y --no-install-recommends && dpkg -i /tmp/astap/*.deb) \
+    && rm -rf /tmp/astap /var/lib/apt/lists/*
+
+ENV ASTAP_BINARY_PATH=/opt/astap/astap \
+    ASTAP_DATA_DIR=/opt/astap/data
+
+RUN mkdir -p /opt/astap/data
+
 COPY requirements.txt ./
+# Pre-install the CPU-only torch wheel before the main requirements pass.
+# sentence-transformers depends on torch>=1.11.0 but does not require CUDA.
+# Without this, pip resolves the default CUDA wheel (~2.5 GB) even though
+# neither the mcp nor app container has GPU access.  Installing the CPU
+# variant first satisfies the torch constraint so pip won't fetch CUDA builds.
 RUN pip install --upgrade pip \
+    && pip install torch --index-url https://download.pytorch.org/whl/cpu \
     && pip install -r requirements.txt
+
+# pyindi-client must be built against system libindi/SWIG headers with --no-build-isolation.
+# Cloned manually so indiclientpython.i can be patched before the SWIG step runs.
+# Clone at pinned commit, patch indiclientpython.i to suppress copy/move ctor wrappers
+# for WidgetView<ILight> and WidgetView<IBLOB> whose SWIG-generated code fails to compile.
+RUN pip install setuptools wheel meson-python ninja \
+    && git clone --filter=blob:none https://github.com/indilib/pyindi-client.git /tmp/pyindi \
+    && git -C /tmp/pyindi checkout c79c1bf \
+    && sed -i \
+        's|%include <indipropertyview.h>|%ignore INDI::WidgetView::WidgetView(WidgetView const \&);\n%ignore INDI::WidgetView::WidgetView(WidgetView \&\&);\n%include <indipropertyview.h>|' \
+        /tmp/pyindi/indiclientpython.i \
+    && pip install --no-build-isolation /tmp/pyindi \
+    && rm -rf /tmp/pyindi
 
 COPY . .

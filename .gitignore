@@ -4,9 +4,15 @@ ai/*
 data/downloads/*
 duckdb-extensions/*
 
+# Sample Data
+data/pdf/*
+
 # Sqlite databases
 *.sqlite3
 *.db
+
+# ASTAP binaries and data (keep .gitkeep for empty directories)
+astap/*
 
 # Downloaded datasets (keep .gitkeep for empty directories)
 *.parquet
@@ -36,6 +42,13 @@ Thumbs.db
 # Environment
 .env
 .env.local
+
+# TLS certificates and ACME artifacts
+certs/selfsigned/*.key
+certs/selfsigned/*.crt
+certs/letsencrypt/
+certs/lib/
+certs/log/
 
 # Python
 .venv/

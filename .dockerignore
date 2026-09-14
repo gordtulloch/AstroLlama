@@ -16,6 +16,13 @@ ai/*.safetensors
 data/chromadb/
 data/conversations/
 data/downloads/
+data/pdf/
+data/images/
+data/documents/
 logs/
 
 static/readme screenshot.png
+
+certs/letsencrypt/
+certs/lib/
+certs/log/

@@ -19,7 +19,7 @@ The runtime stack now uses Docker Compose for all required servers.
 - **Docker Desktop** (or Docker Engine + Compose plugin)
 - **NVIDIA Container Toolkit** + recent NVIDIA drivers (for CUDA/GPU inference)
 - **PowerShell 7+ (`pwsh`)** for the helper scripts
-- A **GGUF model** file in `ai/` (default: `Llama-3.2-1B.Q8_0.gguf`)
+- A **GGUF model** file in `ai/` (default: `qwen2.5-3b-instruct-q8_0.gguf`)
 
 ## Installation
 
@@ -34,7 +34,23 @@ cd AstroLlama
 
 Place a compatible GGUF model file in the `ai/` directory (example files are already listed there), **or** set `MODEL_PATH` in `.env` to its full path.
 
-Tested models: `Llama-3.2-1B.Q8_0.gguf`, `Qwen2.5-3B-Instruct-Q8_0.gguf`, `mistral-7b-instruct-v0.2.Q3_K_M.gguf`.
+You can also download a model file directly from Hugging Face:
+
+```powershell
+python .\download_model.py
+```
+
+That zero-argument form downloads the default Qwen GGUF model and saves it as `ai/qwen2.5-3b-instruct-q8_0.gguf`.
+
+You can still override the source model explicitly:
+
+```powershell
+python .\download_model.py bartowski/Qwen2.5-3B-Instruct-GGUF Qwen2.5-3B-Instruct-Q8_0.gguf
+```
+
+If the repository is gated, set `HF_TOKEN` first. The script copies the downloaded file into `./ai` by default.
+
+Tested models: `qwen2.5-3b-instruct-q8_0.gguf`, `Llama-3.2-1B.Q8_0.gguf`, `mistral-7b-instruct-v0.2.Q3_K_M.gguf`.
 
 ### 3. Configure the environment
 
@@ -53,7 +69,7 @@ Optional Docker runtime overrides (used by `docker-compose.yml`):
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LLAMA_CPP_IMAGE` | `ghcr.io/ggerganov/llama.cpp:server-cuda` | CUDA-enabled llama.cpp server image |
-| `LLAMA_MODEL_FILE` | `Llama-3.2-1B.Q8_0.gguf` | Model file name under `./ai` |
+| `LLAMA_MODEL_FILE` | `qwen2.5-3b-instruct-q8_0.gguf` | Model file name under `./ai` |
 | `LLAMA_CTX_SIZE` | `8192` | llama.cpp context window |
 | `LLAMA_NGL` | `99` | Number of GPU layers |
 | `LLAMA_PORT` | `8081` | Host port mapped to llama service |
@@ -112,6 +128,49 @@ docker compose logs -f
 .\stop.ps1       # docker compose down --remove-orphans
 .\restart.ps1    # docker compose down + up -d --build
 ```
+
+## HTTPS for remote voice
+
+Browser microphone access for remote clients requires HTTPS (localhost is the only HTTP exception).
+
+### Option A: Self-signed cert (fastest)
+
+Generate cert files using a containerized OpenSSL flow:
+
+```powershell
+.\create_self_signed_cert.ps1 -Domain astrollama.openastronomy.ca
+```
+
+Then set in `.env`:
+
+```ini
+APP_TLS_ENABLED=true
+APP_TLS_CERTFILE=/certs/selfsigned/astrollama.crt
+APP_TLS_KEYFILE=/certs/selfsigned/astrollama.key
+```
+
+Restart AstroLlama and open `https://<host-or-ip>:8080`.
+
+### Option B: Let's Encrypt with Register.ca (manual DNS-01)
+
+Register.ca does not offer direct DNS automation for common ACME clients, so use manual DNS-01 from a Certbot container:
+
+```powershell
+.\issue_le_cert.ps1 -Domain astrollama.openastronomy.ca -Email you@openastronomy.ca
+```
+
+Certbot will prompt for a TXT record at `_acme-challenge.astrollama.openastronomy.ca`.
+Create that TXT record in Register.ca DNS, wait for propagation, then continue in the prompt.
+
+After issuance, set in `.env`:
+
+```ini
+APP_TLS_ENABLED=true
+APP_TLS_CERTFILE=/certs/letsencrypt/live/astrollama.openastronomy.ca/fullchain.pem
+APP_TLS_KEYFILE=/certs/letsencrypt/live/astrollama.openastronomy.ca/privkey.pem
+```
+
+Renew manually using the same script workflow before expiry. For testing, add `-Staging`.
 
 ## RAG — Indexing local documents
 
@@ -226,6 +285,9 @@ The MCP server exposes tools that the AI can call automatically:
 - **Constellation maps** — generate star-field charts for any constellation or object
 - **AAVSO finder charts** — variable-star comparison charts
 - **Variable star comparison stars** — retrieve comparison star sequences
+- **Alpaca device discovery** — inspect the configured telescope/camera server before imaging
+- **Alpaca telescope imaging** — slew to an object or coordinates, start non-blocking capture jobs, poll status, and save FITS files with downloadable links
+- **Alpaca camera diagnostics** — query live sensor/Bayer/color metadata to help interpret FITS output correctly
 
 MCP tool use is enabled by default (`MCP_ENABLED=true`). Set `MCP_ENABLED=false` in `.env` to disable it.
 
@@ -257,6 +319,11 @@ All settings can be set in `.env`. Key options:
 | `MCP_SERVER_URL` | `http://localhost:8000/mcp` | MCP server endpoint |
 | `APP_HOST` | `127.0.0.1` | Host the web client binds to |
 | `APP_PORT` | `8080` | Port the web client listens on |
+| `APP_TLS_ENABLED` | `false` | Enable HTTPS when cert/key files are present |
+| `APP_TLS_CERTFILE` | *(empty)* | Container path to TLS certificate file |
+| `APP_TLS_KEYFILE` | *(empty)* | Container path to TLS private key file |
+| `APP_DOMAIN` | *(empty)* | Domain used for certificate issuance workflows |
+| `ACME_EMAIL` | *(empty)* | Email used by ACME clients (Let's Encrypt) |
 | `DEFAULT_MAX_TOKENS` | `1024` | Maximum tokens per response |
 | `DEFAULT_CONTEXT_SIZE` | `4096` | Context window size |
 | `RAG_ENABLED` | `true` | Enable ChromaDB retrieval-augmented generation |

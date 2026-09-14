@@ -15,6 +15,54 @@ _WMO_CODES = {
 }
 
 
+def _build_geocode_search_terms(location: str) -> list[str]:
+    """Build a small fallback query list for Open-Meteo geocoding."""
+    search_terms: list[str] = []
+    if location:
+        search_terms.append(location)
+
+    if location and "," not in location:
+        tokens = [t for t in location.split() if t]
+        if len(tokens) >= 2:
+            search_terms.append(f"{tokens[0]}, {' '.join(tokens[1:])}")
+            search_terms.append(tokens[0])
+        elif len(tokens) == 1:
+            search_terms.append(tokens[0])
+
+    deduped_terms: list[str] = []
+    seen: set[str] = set()
+    for term in search_terms:
+        key = term.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped_terms.append(term)
+    return deduped_terms
+
+
+async def fetch_open_meteo_geocode_results(location: str, count: int = 1) -> tuple[list[dict], str]:
+    """Return geocoding API results and the resolved query term used."""
+    count = max(1, min(int(count), 5))
+    location = (location or "").strip()
+
+    terms = _build_geocode_search_terms(location)
+    results: list[dict] = []
+    resolved_term = location
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        for term in terms:
+            params = {"name": term, "count": count, "language": "en", "format": "json"}
+            resp = await client.get("https://geocoding-api.open-meteo.com/v1/search", params=params)
+            resp.raise_for_status()
+            data = resp.json()
+            results = data.get("results", [])
+            if results:
+                resolved_term = term
+                break
+
+    return results, resolved_term
+
+
 async def get_current_time(location: str) -> str:
     """Return the current local time for a city by geocoding it to a timezone."""
     from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -64,19 +112,17 @@ async def get_current_time(location: str) -> str:
 
 async def fetch_open_meteo_geocode(location: str, count: int = 1) -> str:
     """Geocode a place name using Open-Meteo geocoding API (free, no API key)."""
-    count = max(1, min(int(count), 5))
-    params = {"name": location, "count": count, "language": "en", "format": "json"}
+    location = (location or "").strip()
+    results, resolved_term = await fetch_open_meteo_geocode_results(location=location, count=count)
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.get("https://geocoding-api.open-meteo.com/v1/search", params=params)
-        resp.raise_for_status()
-        data = resp.json()
-
-    results = data.get("results", [])
     if not results:
         return f"No results found for '{location}'."
 
     lines = [f"Geocoding results for: {location}", "=" * (25 + len(location)), ""]
+    if resolved_term.lower() != location.lower():
+        lines.append(f"Resolved using fallback query: {resolved_term}")
+        lines.append("")
+
     for i, r in enumerate(results, 1):
         name_parts = [r.get("name", "")]
         for field in ("admin1", "admin2", "country"):

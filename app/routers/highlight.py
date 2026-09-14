@@ -23,7 +23,26 @@ _FORMATTER = HtmlFormatter(style=_STYLE, cssclass="highlight")
 
 # Matches fenced code blocks: ```lang\n code \n```
 # \n? before closing fence tolerates a trailing newline inside the block.
-_CODE_BLOCK_RE = re.compile(r"```(\w*)[^\S\r\n]*\n([\s\S]*?\n?)```", re.MULTILINE)
+_CODE_BLOCK_RE = re.compile(
+    # Supports both LF and CRLF fences and language ids like c++, c#, objective-c.
+    r"```(?:[ \t]*([A-Za-z0-9_+.#-]+))?[^\r\n]*\r?\n([\s\S]*?)(?:\r?\n)?```",
+    re.MULTILINE,
+)
+
+_LANG_ALIASES = {
+    "py": "python",
+    "js": "javascript",
+    "ts": "typescript",
+    "shell": "bash",
+    "sh": "bash",
+    "zsh": "bash",
+    "f90": "fortran",
+    "f95": "fortran",
+    "f03": "fortran",
+    "f08": "fortran",
+    "fortran90": "fortran",
+    "fortran95": "fortran",
+}
 
 # Matches bare "Image: /api/files/<name>.ext" lines produced by generate_map.
 _IMAGE_LINE_RE = re.compile(
@@ -86,7 +105,8 @@ def _render(text: str) -> str:
         if before.strip():
             result.append(_render_prose(before))
 
-        lang = m.group(1).strip().lower()
+        lang_raw = (m.group(1) or "").strip().lower()
+        lang = _LANG_ALIASES.get(lang_raw, lang_raw)
         code = m.group(2)
 
         if lang == "html":

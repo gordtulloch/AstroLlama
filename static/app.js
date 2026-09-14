@@ -50,6 +50,12 @@
   const authUser     = document.getElementById("auth-user");
   const btnLogin     = document.getElementById("btn-login");
   const btnLogout    = document.getElementById("btn-logout");
+  const appEl        = document.getElementById("app");
+  const sidebarEl    = document.getElementById("sidebar");
+  const sidebarBackdrop = document.getElementById("sidebar-backdrop");
+  const btnSidebarToggle = document.getElementById("btn-sidebar-toggle");
+  const inputControls = document.getElementById("input-controls");
+  const btnMoreActions = document.getElementById("btn-more-actions");
 
   const toolValvesController = window.createToolValvesController
     ? window.createToolValvesController({ apiFetch })
@@ -59,16 +65,21 @@
   const sTemperature  = document.getElementById("s-temperature");
   const sTopP         = document.getElementById("s-top_p");
   const sMaxTokens    = document.getElementById("s-max_tokens");
+  const sRepetitionPenalty = document.getElementById("s-repetition_penalty");
   const sSystemPrompt = document.getElementById("s-system_prompt");
   const sVoice        = document.getElementById("s-voice");
   const sVoiceRate    = document.getElementById("s-voice-rate");
   const sVoicePitch   = document.getElementById("s-voice-pitch");
   const sReactiveOrb  = document.getElementById("s-reactive-orb");
   const sVizFullscreenDefault = document.getElementById("s-viz-fullscreen-default");
+  const sHideToolBubbles = document.getElementById("s-hide-tool-bubbles");
+  const sDisableVoiceProcessing = document.getElementById("s-disable-voice-processing");
 
   const ui = {
     preferFullscreenViz: false,
     voiceStartRequired: false,
+    hideToolBubbles: false,
+    voiceDisabled: false,
   };
 
   const VOICE_START_KEY = "chat_voice_started_once";
@@ -129,13 +140,26 @@
       if (saved.temperature  !== undefined) sTemperature.value  = saved.temperature;
       if (saved.top_p        !== undefined) sTopP.value         = saved.top_p;
       if (saved.max_tokens   !== undefined) sMaxTokens.value    = saved.max_tokens;
+      if (saved.repetition_penalty !== undefined) sRepetitionPenalty.value = saved.repetition_penalty;
       if (saved.system_prompt !== undefined) sSystemPrompt.value = saved.system_prompt;
       if (typeof saved.open_viz_fullscreen === "boolean") {
         ui.preferFullscreenViz = saved.open_viz_fullscreen;
       }
+      if (typeof saved.hide_tool_bubbles === "boolean") {
+        ui.hideToolBubbles = saved.hide_tool_bubbles;
+      }
+      if (typeof saved.disable_voice_processing === "boolean") {
+        ui.voiceDisabled = saved.disable_voice_processing;
+      }
     } catch (_) {}
     if (sVizFullscreenDefault) {
       sVizFullscreenDefault.checked = ui.preferFullscreenViz;
+    }
+    if (sHideToolBubbles) {
+      sHideToolBubbles.checked = ui.hideToolBubbles;
+    }
+    if (sDisableVoiceProcessing) {
+      sDisableVoiceProcessing.checked = ui.voiceDisabled;
     }
   }
 
@@ -144,12 +168,123 @@
       temperature:   parseFloat(sTemperature.value),
       top_p:         parseFloat(sTopP.value),
       max_tokens:    parseInt(sMaxTokens.value, 10),
+      repetition_penalty: parseFloat(sRepetitionPenalty.value),
       system_prompt: sSystemPrompt.value,
       open_viz_fullscreen: ui.preferFullscreenViz,
+      hide_tool_bubbles: ui.hideToolBubbles,
+      disable_voice_processing: ui.voiceDisabled,
     }));
   }
 
-  [sTemperature, sTopP, sMaxTokens, sSystemPrompt].forEach(el =>
+  function isVoiceProcessingDisabled() {
+    return Boolean(ui.voiceDisabled);
+  }
+
+  function isLocalhostHost(hostname) {
+    const host = String(hostname || "").toLowerCase();
+    return host === "localhost" || host === "127.0.0.1" || host === "::1";
+  }
+
+  function hasSecureMicContext() {
+    if (window.isSecureContext) return true;
+    return isLocalhostHost(window.location && window.location.hostname);
+  }
+
+  function setVoiceUiVisible(visible) {
+    const voiceElements = [
+      btnMic,
+      btnVizFullscreen,
+      btnTts,
+      btnVoicePreview,
+      sVoice,
+      sVoiceRate,
+      sVoicePitch,
+      sReactiveOrb,
+    ];
+
+    for (const el of voiceElements) {
+      if (!el) continue;
+      const host = el.closest("label") || el;
+      host.classList.toggle("voice-hidden-by-setting", !visible);
+    }
+  }
+
+  function applyVoiceProcessingSetting() {
+    const voiceEnabled = !isVoiceProcessingDisabled();
+    setVoiceUiVisible(voiceEnabled);
+
+    if (voiceStartGate) {
+      voiceStartGate.toggleAttribute("inert", !voiceEnabled);
+    }
+    if (btnVoiceStart) {
+      btnVoiceStart.disabled = !voiceEnabled;
+    }
+
+    if (!voiceEnabled) {
+      ui.voiceStartRequired = false;
+      hideVoiceStartGate();
+      if (speech.listening) {
+        stopSpeechRecognition();
+      }
+      speech.userStopped = true;
+      speech.awaitingWake = true;
+      speech.keepArmed = false;
+      cancelSpeechOutput();
+      tts.enabled = false;
+      localStorage.setItem("chat_tts_enabled", "false");
+    } else {
+      ui.voiceStartRequired = Boolean((speech.supported || tts.supported) && !hasVoiceStartedOnce());
+      if (ui.voiceStartRequired) {
+        showVoiceStartGate();
+      } else {
+        hideVoiceStartGate();
+      }
+      if (speech.recognition && !speech.listening && !ui.voiceStartRequired) {
+        speech.userStopped = false;
+        startSpeechRecognition();
+      }
+    }
+
+    updateTtsButtonState();
+    setMicButtonState();
+    updateSidebarPulse();
+  }
+
+  function isCompactLayout() {
+    return window.matchMedia("(max-width: 834px)").matches;
+  }
+
+  function isPhoneLayout() {
+    return window.matchMedia("(max-width: 640px)").matches;
+  }
+
+  function setSidebarOpen(open) {
+    if (!appEl || !sidebarEl) return;
+    const nextOpen = Boolean(open) && isCompactLayout();
+    appEl.classList.toggle("sidebar-open", nextOpen);
+    document.body.classList.toggle("sidebar-open", nextOpen);
+    if (sidebarBackdrop) {
+      sidebarBackdrop.setAttribute("aria-hidden", nextOpen ? "false" : "true");
+    }
+    if (btnSidebarToggle) {
+      btnSidebarToggle.setAttribute("aria-expanded", nextOpen ? "true" : "false");
+    }
+  }
+
+  function closeSidebarIfCompact() {
+    if (!isCompactLayout()) return;
+    setSidebarOpen(false);
+  }
+
+  function setMoreActionsOpen(open) {
+    if (!inputControls || !btnMoreActions) return;
+    const nextOpen = Boolean(open) && isPhoneLayout();
+    inputControls.classList.toggle("more-open", nextOpen);
+    btnMoreActions.setAttribute("aria-expanded", nextOpen ? "true" : "false");
+    btnMoreActions.textContent = nextOpen ? "Less" : "More";
+  }
+
+  [sTemperature, sTopP, sMaxTokens, sRepetitionPenalty, sSystemPrompt].forEach(el =>
     el.addEventListener("change", saveSettings)
   );
 
@@ -204,6 +339,7 @@
   }
 
   function completeVoiceStart(source = "voice_start") {
+    if (isVoiceProcessingDisabled()) return;
     markTtsGestureUnlocked(source);
     tts.enabled = true;
     localStorage.setItem("chat_tts_enabled", "true");
@@ -463,6 +599,14 @@
 
   function updateTtsButtonState() {
     if (!btnTts) return;
+    if (isVoiceProcessingDisabled()) {
+      btnTts.disabled = true;
+      btnTts.classList.remove("enabled");
+      btnTts.setAttribute("aria-pressed", "false");
+      btnTts.textContent = "Voice Off";
+      btnTts.title = "Voice features are disabled in Settings";
+      return;
+    }
     const canUse = tts.supported;
     btnTts.disabled = !canUse;
     btnTts.classList.toggle("enabled", tts.enabled);
@@ -760,6 +904,7 @@
   }
 
   function enqueueStreamingSpeech(text) {
+    if (isVoiceProcessingDisabled()) return;
     if (!tts.supported || !tts.enabled) return;
     if (!text) return;
 
@@ -768,11 +913,13 @@
   }
 
   function flushStreamingSpeech() {
+    if (isVoiceProcessingDisabled()) return;
     if (!tts.supported || !tts.enabled) return;
     drainSpeechStreamBuffer(getPreferredVoice(), true);
   }
 
   function speakText(text) {
+    if (isVoiceProcessingDisabled()) return;
     if (!tts.supported || !tts.enabled) return;
     const message = normalizeForSpeech(text);
     if (!message) return;
@@ -788,6 +935,7 @@
   }
 
   function speakWakeGreeting(text, options = {}) {
+    if (isVoiceProcessingDisabled()) return;
     if (!tts.supported || !tts.enabled) {
       logSpeechDebug("wake_tts_skip", {
         text: !tts.supported ? "tts_not_supported" : "tts_disabled",
@@ -970,6 +1118,7 @@
     installTtsGestureUnlockListeners();
 
     btnTts.addEventListener("click", () => {
+      if (isVoiceProcessingDisabled()) return;
       markTtsGestureUnlocked("voice_button_click");
       tts.enabled = !tts.enabled;
       if (!tts.enabled) {
@@ -1023,6 +1172,7 @@
 
     if (btnVoicePreview) {
       btnVoicePreview.addEventListener("click", () => {
+        if (isVoiceProcessingDisabled()) return;
         markTtsGestureUnlocked("voice_preview_click");
         const wasEnabled = tts.enabled;
         tts.enabled = true;
@@ -1065,9 +1215,27 @@
       .trim();
   }
 
+  // Events that fire in tight loops (auto-restart cycles, interim results) are
+  // throttled so they don't turn into a continuous stream of POST requests.
+  const _speechDebugThrottleMs = {
+    recognition_start: 10_000,
+    recognition_end:   10_000,
+    speech_interim:     5_000,
+    speech_wake_miss:   5_000,
+  };
+  const _speechDebugLastSent = {};
+
   function logSpeechDebug(event, details = {}) {
     const text = String(details.text || "").slice(0, 4096);
     if (!text) return;
+
+    const throttleMs = _speechDebugThrottleMs[event];
+    if (throttleMs) {
+      const now = Date.now();
+      const last = _speechDebugLastSent[event] || 0;
+      if (now - last < throttleMs) return;
+      _speechDebugLastSent[event] = now;
+    }
 
     const payload = {
       event,
@@ -1262,6 +1430,15 @@
 
   function setMicButtonState() {
     if (!btnMic) return;
+    if (isVoiceProcessingDisabled()) {
+      btnMic.disabled = true;
+      btnMic.classList.remove("listening", "blocked");
+      btnMic.setAttribute("aria-pressed", "false");
+      btnMic.textContent = "Mic";
+      btnMic.title = "Voice features are disabled in Settings";
+      updateSidebarPulse();
+      return;
+    }
     const micActive = speech.listening || speech.monitoringTts;
     const disabled = !speech.supported || speech.monitoringTts || tts.speaking;
     const entraDirectMode = isEntraSignedIn();
@@ -1284,6 +1461,9 @@
     } else if (speech.monitoringTts) {
       btnMic.textContent = "Mic Live";
       btnMic.title = "Mic monitor active while speech is playing";
+    } else if (speech.blockedReason === "insecure-context") {
+      btnMic.textContent = "Mic HTTPS";
+      btnMic.title = "Microphone access requires HTTPS (or localhost). Open this site over HTTPS to use voice input.";
     } else if (speech.blockedReason === "network") {
       btnMic.textContent = "Mic Error";
       btnMic.title = speech.lastProbeResult.startsWith("silent:")
@@ -1365,7 +1545,18 @@
   }
 
   function startSpeechRecognition() {
+    if (isVoiceProcessingDisabled()) return;
     if (!speech.recognition || speech.listening) return;
+    if (!hasSecureMicContext()) {
+      speech.userStopped = true;
+      speech.blockedReason = "insecure-context";
+      setMicButtonState();
+      logSpeechDebug("recognition_error", {
+        text: "insecure-context",
+        extra: { error: "insecure-context" },
+      });
+      return;
+    }
     speech.userStopped = false;
     speech.blockedReason = "";
     speech.awaitingWake = true;
@@ -1598,7 +1789,7 @@
         probeSpeechMicrophone().catch(() => {});
       }
       if (errorCode === "not-allowed" || errorCode === "service-not-allowed") {
-        speech.blockedReason = errorCode;
+        speech.blockedReason = hasSecureMicContext() ? errorCode : "insecure-context";
         speech.userStopped = true;
       }
     };
@@ -1627,6 +1818,7 @@
     speech.recognition = recognition;
 
     btnMic.addEventListener("click", () => {
+      if (isVoiceProcessingDisabled()) return;
       if (ui.voiceStartRequired) {
         completeVoiceStart("mic_button_click");
         return;
@@ -1643,7 +1835,7 @@
     });
 
     setMicButtonState();
-    if (!ui.voiceStartRequired) {
+    if (!ui.voiceStartRequired && !isVoiceProcessingDisabled()) {
       startSpeechRecognition();
     }
   }
@@ -2154,7 +2346,10 @@
 
         li.appendChild(nameSpan);
         li.appendChild(delBtn);
-        li.addEventListener("click", () => loadConv(conv.id));
+        li.addEventListener("click", () => {
+          closeSidebarIfCompact();
+          loadConv(conv.id);
+        });
         convList.appendChild(li);
       });
     } catch (_) {}
@@ -2207,6 +2402,7 @@
         top_p:         parseFloat(sTopP.value),
         max_tokens:    parseInt(sMaxTokens.value, 10),
         system_prompt: sSystemPrompt.value,
+        hide_tool_bubbles: ui.hideToolBubbles,
       },
     };
     const r = await apiFetch("/api/conversations", {
@@ -2230,6 +2426,7 @@
     content.className = "msg-content";
     if (role === "assistant") {
       content.innerHTML = await renderHighlighted(text);
+      renderMath(content);
     } else {
       const p = document.createElement("p");
       p.textContent = text;
@@ -2269,8 +2466,9 @@
     const params = new URLSearchParams(query);
     const title = (params.get("title") || "").trim();
     const paperId = (params.get("paper_id") || "").trim();
+    const articleUrl = (params.get("article_url") || "").trim();
     if (!title) return null;
-    return { title, paperId };
+    return { title, paperId, articleUrl };
   }
 
   // ---- Tool call details block (inside an assistant message) -------
@@ -2313,6 +2511,7 @@
         const resultDiv = document.createElement("div");
         resultDiv.className = "tool-result";
         resultDiv.innerHTML = await renderHighlighted(resultText);
+        renderMath(resultDiv);
         entry.appendChild(resultDiv);
       }
       details.open = true;
@@ -2328,6 +2527,7 @@
       const resultDiv = document.createElement("div");
       resultDiv.className = "tool-result";
       resultDiv.innerHTML = await renderHighlighted(resultText);
+      renderMath(resultDiv);
       div.appendChild(resultDiv);
     }
     details.appendChild(div);
@@ -2409,11 +2609,20 @@
    * Falls back to client-side <pre><code> rendering on error.
    */
   async function renderHighlighted(text) {
+    const normalizedText = normalizeLegacyMathDelimiters(text);
+
+    // Server-side markdown can mangle LaTeX-like text (e.g., backslashes/underscores).
+    // For math-heavy responses, prefer client-side markdown so delimiters survive for KaTeX.
+    if (containsLikelyMath(normalizedText)) {
+      const rendered = marked.parse(normalizedText);
+      return rendered.replace(/<a\b(?![^>]*\btarget=)([^>]*)>/gi, '<a$1 target="_blank" rel="noopener noreferrer">');
+    }
+
     try {
       const r = await apiFetch("/api/highlight", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text }),
+        body: JSON.stringify({ text: normalizedText }),
       });
       if (r.ok) {
         const data = await r.json();
@@ -2424,8 +2633,133 @@
       console.warn("[Highlight] API call failed:", err);
     }
     // Client-side fallback: use marked.js for full markdown rendering
-    const rendered = marked.parse(text);
+    const rendered = marked.parse(normalizedText);
     return rendered.replace(/<a\b(?![^>]*\btarget=)([^>]*)>/gi, '<a$1 target="_blank" rel="noopener noreferrer">');
+  }
+
+  /**
+   * Convert legacy equation blocks like `[ \lambda = ... ]` into KaTeX-ready
+   * display delimiters `\[ ... \]` when the bracketed line appears to be math.
+   */
+  function normalizeLegacyMathDelimiters(text) {
+    if (!text) return text;
+
+    const looksLikeMath = (inner) => /[\\^_=]|\\frac|\\text|\\lambda|\\alpha|\\beta|\\gamma|\\times|\\cdot|\\sum|\\int|\d\s*[=+\-*/]|\{[^}]+\}/.test(inner);
+
+    const src = String(text);
+
+    // 0) Unescape legacy inline math wrappers: \$ ... \$ => $ ... $
+    const withUnescapedDollars = src.replace(/\\\$\s*([^$]+?)\s*\\\$/g, (full, inner) => {
+      if (!looksLikeMath(inner)) return full;
+      return `$${inner}$`;
+    });
+
+    // 1) Convert legacy display blocks only when they occupy an entire line:
+    // [ ... ] => $$ ... $$
+    const withBrackets = withUnescapedDollars.replace(/^\[\s*(.+?)\s*\]$/gm, (full, inner) => {
+      if (!looksLikeMath(inner)) return full;
+      return `$$ ${inner} $$`;
+    });
+
+    // 2) Convert double parens: (( ... )) => $ ... $
+    const withDoubleParens = withBrackets.replace(/\(\(\s*([\s\S]*?)\s*\)\)/g, (full, inner) => {
+      if (!looksLikeMath(inner)) return full;
+      return `$${inner}$`;
+    });
+
+    // 3) Convert legacy single-paren LaTeX snippets: (\lambda_{max}) => $\lambda_{max}$
+    // Only convert when there is a LaTeX-style backslash command to avoid prose rewrites.
+    const withSingleParensLatex = withDoubleParens.replace(/\(([^()\n]{1,180})\)/g, (full, inner) => {
+      if (!/\\[a-zA-Z]+/.test(inner)) return full;
+      if (!looksLikeMath(inner)) return full;
+      return `$${inner.trim()}$`;
+    });
+
+    return withSingleParensLatex;
+  }
+
+  function containsLikelyMath(text) {
+    if (!text) return false;
+    return /(\$\$|\$[^$\n]+\$|\\\(|\\\)|\\\[|\\\]|\\frac|\\text|\\lambda|\\alpha|\\beta|\\gamma|\\times|\\cdot|\\sum|\\int)/.test(text);
+  }
+
+  function applyLocalMathFallback(container) {
+    if (!container) return;
+    if (container.dataset.mathFallbackApplied === "1") return;
+    const html = String(container.innerHTML || "");
+    const next = renderMathHtmlFallback(html);
+    if (next !== html) {
+      container.innerHTML = next;
+      container.dataset.mathFallbackApplied = "1";
+    }
+  }
+
+  function renderMathHtmlFallback(html) {
+    if (!html) return html;
+
+    const renderInline = (expr) => `<span class="math-fallback">${latexToBasicHtml(expr)}</span>`;
+    const renderDisplay = (expr) => `<div class="math-fallback display">${latexToBasicHtml(expr)}</div>`;
+
+    let out = String(html);
+    out = out.replace(/\$\$([\s\S]+?)\$\$/g, (_, expr) => renderDisplay(expr));
+    out = out.replace(/\\\[([\s\S]+?)\\\]/g, (_, expr) => renderDisplay(expr));
+    out = out.replace(/\\\(([\s\S]+?)\\\)/g, (_, expr) => renderInline(expr));
+    out = out.replace(/\$([^$\n]+?)\$/g, (_, expr) => renderInline(expr));
+    return out;
+  }
+
+  function latexToBasicHtml(input, depth = 0) {
+    if (depth > 6) return escHtml(String(input || ""));
+    let s = String(input || "").trim();
+
+    const fracRe = /\\frac\s*\{([^{}]+)\}\s*\{([^{}]+)\}/g;
+    s = s.replace(fracRe, (_, num, den) => {
+      const n = latexToBasicHtml(num, depth + 1);
+      const d = latexToBasicHtml(den, depth + 1);
+      return `<span class="mf-frac"><span class="mf-num">${n}</span><span class="mf-den">${d}</span></span>`;
+    });
+
+    s = escHtml(s)
+      .replace(/\\text\{([^}]*)\}/g, "$1")
+      .replace(/\\times/g, "&times;")
+      .replace(/\\cdot/g, "&middot;")
+      .replace(/\\,|\\;/g, " ")
+      .replace(/\\left|\\right/g, "")
+      .replace(/\\lambda/g, "&lambda;")
+      .replace(/\\alpha/g, "&alpha;")
+      .replace(/\\beta/g, "&beta;")
+      .replace(/\\gamma/g, "&gamma;");
+
+    s = s
+      .replace(/\^\{([^{}]+)\}/g, "<sup>$1</sup>")
+      .replace(/_\{([^{}]+)\}/g, "<sub>$1</sub>")
+      .replace(/\^([A-Za-z0-9+\-])/g, "<sup>$1</sup>")
+      .replace(/_([A-Za-z0-9+\-])/g, "<sub>$1</sub>");
+
+    s = s.replace(/[{}]/g, "").replace(/\s{2,}/g, " ");
+    return s;
+  }
+
+  /** Render LaTeX delimiters in a container using MathJax, if available. */
+  function renderMath(container) {
+    if (!container) return;
+    const mj = window.MathJax;
+    if (!mj || typeof mj.typesetPromise !== "function") {
+      const retries = Number(container.dataset.mathRenderRetries || "0");
+      if (retries < 10) {
+        container.dataset.mathRenderRetries = String(retries + 1);
+        setTimeout(() => renderMath(container), 50);
+      } else {
+        applyLocalMathFallback(container);
+      }
+      return;
+    }
+    delete container.dataset.mathRenderRetries;
+
+    mj.typesetPromise([container]).catch((err) => {
+      console.warn("[Math] MathJax render failed:", err);
+      applyLocalMathFallback(container);
+    });
   }
 
   // ---- Send message ------------------------------------------------
@@ -2466,7 +2800,9 @@
         temperature:   parseFloat(sTemperature.value),
         top_p:         parseFloat(sTopP.value),
         max_tokens:    parseInt(sMaxTokens.value, 10),
+        repetition_penalty: parseFloat(sRepetitionPenalty.value),
         system_prompt: sSystemPrompt.value || null,
+        hide_tool_bubbles: ui.hideToolBubbles,
       },
     };
 
@@ -2584,6 +2920,7 @@
                   contentEl.innerHTML = textForRender
                     ? await renderHighlighted(textForRender)
                     : "";
+                  renderMath(contentEl);
                 }
                 // Re-append all tool-image thumbnails so they always appear
                 // after the text content, regardless of SSE event order.
@@ -2639,7 +2976,7 @@
   }
 
   promptInput.addEventListener("keydown", (e) => {
-    if (ui.voiceStartRequired) {
+    if (ui.voiceStartRequired && !isVoiceProcessingDisabled()) {
       completeVoiceStart("keyboard_input");
     }
     if (e.key === "Enter" && !e.shiftKey) {
@@ -2659,9 +2996,14 @@
     e.preventDefault();
     if (state.streaming) return;
 
-    const prompt = parsed.paperId
-      ? `Retrieve and summarize the arXiv paper "${parsed.title}" (arXiv:${parsed.paperId}) using load_paper_html_text.`
-      : `Retrieve and summarize the paper "${parsed.title}" using load_paper_html_text.`;
+    let prompt = "";
+    if (parsed.paperId) {
+      prompt = `Retrieve and summarize the arXiv paper "${parsed.title}" (arXiv:${parsed.paperId}) using load_paper_html_text.`;
+    } else if (parsed.articleUrl) {
+      prompt = `Retrieve and summarize the news article "${parsed.title}" from ${parsed.articleUrl} using load_news_article_text.`;
+    } else {
+      prompt = `Retrieve and summarize the paper "${parsed.title}" using load_paper_html_text.`;
+    }
     promptInput.value = prompt;
     promptInput.dispatchEvent(new Event("input", { bubbles: true }));
     sendMessage();
@@ -2672,6 +3014,10 @@
   });
 
   document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && appEl && appEl.classList.contains("sidebar-open")) {
+      setSidebarOpen(false);
+      return;
+    }
     if (e.key === "Escape" && toolValvesController && toolValvesController.isOpen()) {
       toolValvesController.close();
       return;
@@ -2708,6 +3054,21 @@
     });
   }
 
+  if (sHideToolBubbles) {
+    sHideToolBubbles.addEventListener("change", () => {
+      ui.hideToolBubbles = Boolean(sHideToolBubbles.checked);
+      saveSettings();
+    });
+  }
+
+  if (sDisableVoiceProcessing) {
+    sDisableVoiceProcessing.addEventListener("change", () => {
+      ui.voiceDisabled = Boolean(sDisableVoiceProcessing.checked);
+      saveSettings();
+      applyVoiceProcessingSetting();
+    });
+  }
+
   document.addEventListener("fullscreenchange", () => {
     const active = Boolean(document.fullscreenElement && fullscreenViz && document.fullscreenElement === fullscreenViz);
     if (!fullscreenViz) return;
@@ -2716,8 +3077,52 @@
     updateVizFullscreenButtonState();
   });
 
-  btnNewChat.addEventListener("click", newChat);
-  btnSaveConv.addEventListener("click", saveConv);
+  if (btnSidebarToggle) {
+    btnSidebarToggle.addEventListener("click", () => {
+      const currentlyOpen = Boolean(appEl && appEl.classList.contains("sidebar-open"));
+      setSidebarOpen(!currentlyOpen);
+    });
+  }
+
+  if (btnMoreActions) {
+    btnMoreActions.addEventListener("click", () => {
+      const currentlyOpen = Boolean(inputControls && inputControls.classList.contains("more-open"));
+      setMoreActionsOpen(!currentlyOpen);
+    });
+  }
+
+  if (sidebarBackdrop) {
+    sidebarBackdrop.addEventListener("click", () => {
+      setSidebarOpen(false);
+    });
+  }
+
+  window.addEventListener("resize", () => {
+    if (!isCompactLayout()) {
+      setSidebarOpen(false);
+    }
+    if (!isPhoneLayout()) {
+      setMoreActionsOpen(false);
+    }
+  });
+
+  document.addEventListener("click", (e) => {
+    if (!isPhoneLayout()) return;
+    if (!inputControls || !btnMoreActions) return;
+    const target = e.target instanceof Element ? e.target : null;
+    if (!target) return;
+    if (target.closest("#input-controls")) return;
+    setMoreActionsOpen(false);
+  });
+
+  btnNewChat.addEventListener("click", () => {
+    closeSidebarIfCompact();
+    newChat();
+  });
+  btnSaveConv.addEventListener("click", () => {
+    closeSidebarIfCompact();
+    saveConv();
+  });
   btnLogin.addEventListener("click", () => {
     console.log("[UI] Sign in button clicked");
     signIn().catch(err => {
@@ -2765,7 +3170,7 @@
     
     // Main window initialization
     loadSettings();
-    ui.voiceStartRequired = Boolean((speech.supported || tts.supported) && !hasVoiceStartedOnce());
+    ui.voiceStartRequired = Boolean(!isVoiceProcessingDisabled() && (speech.supported || tts.supported) && !hasVoiceStartedOnce());
     if (ui.voiceStartRequired) {
       showVoiceStartGate();
     } else {
@@ -2774,6 +3179,7 @@
     applyVizFullscreenPreference();
     initTextToSpeech();
     initSpeechRecognition();
+    applyVoiceProcessingSetting();
     await initHighlightStyles();
 
     try {

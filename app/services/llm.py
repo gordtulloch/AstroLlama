@@ -19,6 +19,14 @@ _CONTROL_TOKEN_STOPS = [
     "<|user|>",
 ]
 
+# Sliding-window repetition detector: if the same phrase of at least this
+# many characters appears this many times in the accumulated output, the
+# stream is considered looping and will be truncated.
+_LOOP_MIN_PHRASE_LEN = 40   # chars
+_LOOP_MAX_PHRASE_LEN = 300  # avoid matching against the whole output
+_LOOP_REPEAT_COUNT   = 3    # how many non-overlapping occurrences = loop
+_LOOP_CHECK_WINDOW   = 2000 # only scan the last N chars (performance)
+
 
 def _sanitize_control_tokens(text: str) -> str:
     cleaned = text
@@ -36,6 +44,34 @@ def _truncate_at_control_token(text: str) -> tuple[str, bool]:
     if first_idx < 0:
         return text, False
     return text[:first_idx], True
+
+
+def _detect_output_loop(accumulated: str) -> bool:
+    """
+    Return True when the tail of *accumulated* contains the same phrase
+    repeated _LOOP_REPEAT_COUNT or more times.  Only the last
+    _LOOP_CHECK_WINDOW characters are scanned for performance.
+    """
+    window = accumulated[-_LOOP_CHECK_WINDOW:]
+    n = len(window)
+    # Slide phrase lengths from large to small so we catch the smallest
+    # repeating unit first (avoids false positives from short common words).
+    for phrase_len in range(_LOOP_MAX_PHRASE_LEN, _LOOP_MIN_PHRASE_LEN - 1, -1):
+        if phrase_len >= n:
+            continue
+        # Anchor at the very end of the window: the most recent phrase.
+        candidate = window[n - phrase_len:]
+        count = 0
+        pos = 0
+        while True:
+            idx = window.find(candidate, pos)
+            if idx < 0:
+                break
+            count += 1
+            if count >= _LOOP_REPEAT_COUNT:
+                return True
+            pos = idx + phrase_len  # non-overlapping
+    return False
 
 
 class LlamaServerUnavailableError(Exception):
@@ -72,6 +108,7 @@ class LLMClient:
         temperature: float = 0.7,
         top_p: float = 0.9,
         max_tokens: int = 1024,
+        repetition_penalty: float = 1.15,
     ) -> AsyncIterator[dict[str, Any]]:
         """
         Yield raw parsed SSE data objects from llama-server.
@@ -84,8 +121,12 @@ class LLMClient:
             "messages": messages,
             "temperature": temperature,
             "top_p": top_p,
+            "min_p": 0.05,             # drop tokens below 5% of top-token probability (reduces gibberish)
             "max_tokens": max_tokens,
-            "stream": True,
+            "repeat_penalty": repetition_penalty,
+            "repeat_last_n": 256,      # penalise over recent context; -1 over full ctx can misfire on 3B models
+            "frequency_penalty": 0.1,
+            "stream": use_stream,
             "stop": _CONTROL_TOKEN_STOPS,
         }
         if tools:
@@ -102,6 +143,31 @@ class LLMClient:
         url = f"{self.base_url}/v1/chat/completions"
         for attempt in range(_RETRIES):
             try:
+                if not use_stream:
+                    # Non-streaming path: used when tools are present since
+                    # llama.cpp does not support stream=true with tools.
+                    resp = await self._client.post(url, json=payload)
+                    if resp.status_code >= 400:
+                        logger.error(
+                            "llama-server HTTP %d: %s",
+                            resp.status_code,
+                            resp.text[:1000],
+                        )
+                    resp.raise_for_status()
+                    chunk = resp.json()
+                    # Normalise to streaming-style delta so callers see a
+                    # consistent shape: wrap message as a delta chunk.
+                    choices = chunk.get("choices", [])
+                    if choices and "message" in choices[0] and "delta" not in choices[0]:
+                        message = choices[0]["message"]
+                        # Non-streaming tool_calls lack an index field; inject one so the
+                        # streaming accumulator in tool_orchestrator assigns separate slots.
+                        for i, tc in enumerate(message.get("tool_calls") or []):
+                            tc.setdefault("index", i)
+                        choices[0]["delta"] = message
+                    yield chunk
+                    return
+
                 async with self._client.stream("POST", url, json=payload) as resp:
                     if resp.status_code >= 400:
                         await resp.aread()
@@ -111,6 +177,7 @@ class LLMClient:
                             resp.text[:1000],
                         )
                     resp.raise_for_status()
+                    accumulated_content = ""
                     async for raw_line in resp.aiter_lines():
                         if not raw_line.startswith("data:"):
                             continue
@@ -130,9 +197,19 @@ class LLMClient:
                                     safe_content, found_control = _truncate_at_control_token(content)
                                     delta["content"] = _sanitize_control_tokens(safe_content)
                                     stop_after_chunk = found_control
+                                    accumulated_content += delta["content"]
                             yield chunk
                             if stop_after_chunk:
                                 logger.warning("Control token detected in model stream; truncating response")
+                                return
+                            # Repetition loop guard: check every ~200 chars of new output.
+                            if len(accumulated_content) > _LOOP_CHECK_WINDOW // 2 and _detect_output_loop(accumulated_content):
+                                logger.warning(
+                                    "Output loop detected after %d chars; truncating stream",
+                                    len(accumulated_content),
+                                )
+                                # Signal the caller so it can emit a user-visible notice.
+                                yield {"choices": [{"delta": {"content": ""}, "finish_reason": "loop_truncated"}]}
                                 return
                         except json.JSONDecodeError:
                             logger.debug("Skipping malformed SSE line: %r", raw_line)

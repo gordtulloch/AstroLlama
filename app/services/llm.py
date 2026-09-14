@@ -121,10 +121,11 @@ class LLMClient:
             "messages": messages,
             "temperature": temperature,
             "top_p": top_p,
+            "min_p": 0.05,             # drop tokens below 5% of top-token probability (reduces gibberish)
             "max_tokens": max_tokens,
             "repeat_penalty": repetition_penalty,
-            "repeat_last_n": -1,       # penalise over the full context, not just 64 tokens
-            "frequency_penalty": 0.15, # extra per-token frequency dampening
+            "repeat_last_n": 256,      # penalise over recent context; -1 over full ctx can misfire on 3B models
+            "frequency_penalty": 0.1,
             "stream": use_stream,
             "stop": _CONTROL_TOKEN_STOPS,
         }
@@ -158,7 +159,12 @@ class LLMClient:
                     # consistent shape: wrap message as a delta chunk.
                     choices = chunk.get("choices", [])
                     if choices and "message" in choices[0] and "delta" not in choices[0]:
-                        choices[0]["delta"] = choices[0]["message"]
+                        message = choices[0]["message"]
+                        # Non-streaming tool_calls lack an index field; inject one so the
+                        # streaming accumulator in tool_orchestrator assigns separate slots.
+                        for i, tc in enumerate(message.get("tool_calls") or []):
+                            tc.setdefault("index", i)
+                        choices[0]["delta"] = message
                     yield chunk
                     return
 

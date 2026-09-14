@@ -31,6 +31,7 @@ RUN apt-get update \
         libxtst6 \
         libxi6 \
         libnss-mdns \
+        patchelf \
     && rm -rf /var/lib/apt/lists/*
 
 # Enable mDNS (.local) resolution via the host's avahi-daemon socket.
@@ -60,15 +61,17 @@ RUN pip install --upgrade pip \
     && pip install torch --index-url https://download.pytorch.org/whl/cpu \
     && pip install -r requirements.txt
 
-# pyindi-client uses pyproject.toml and must be built against the system
-# libindi/SWIG headers.  --no-build-isolation skips pip's isolated build
-# environment so the SWIG-generated C extension can find libindiclient.a,
-# libnova, libcfitsio, etc.  setuptools and wheel must be pre-installed so
-# the build backend is available without isolation.
-# Pin to c79c1bf (Jan 22 2026) which is the first commit that builds cleanly
-# against the INDI 2.x headers shipped by Debian trixie's libindi-dev.
-RUN pip install setuptools wheel \
-    && pip install --no-build-isolation \
-        "git+https://github.com/indilib/pyindi-client.git@c79c1bf#egg=pyindi-client"
+# pyindi-client must be built against system libindi/SWIG headers with --no-build-isolation.
+# Cloned manually so indiclientpython.i can be patched before the SWIG step runs.
+# Clone at pinned commit, patch indiclientpython.i to suppress copy/move ctor wrappers
+# for WidgetView<ILight> and WidgetView<IBLOB> whose SWIG-generated code fails to compile.
+RUN pip install setuptools wheel meson-python ninja \
+    && git clone --filter=blob:none https://github.com/indilib/pyindi-client.git /tmp/pyindi \
+    && git -C /tmp/pyindi checkout c79c1bf \
+    && sed -i \
+        's|%include <indipropertyview.h>|%ignore INDI::WidgetView::WidgetView(WidgetView const \&);\n%ignore INDI::WidgetView::WidgetView(WidgetView \&\&);\n%include <indipropertyview.h>|' \
+        /tmp/pyindi/indiclientpython.i \
+    && pip install --no-build-isolation /tmp/pyindi \
+    && rm -rf /tmp/pyindi
 
 COPY . .

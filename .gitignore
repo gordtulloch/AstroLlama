@@ -4,6 +4,9 @@ ai/*
 data/downloads/*
 duckdb-extensions/*
 
+# Sample Data
+data/pdf/*
+
 # Sqlite databases
 *.sqlite3
 *.db

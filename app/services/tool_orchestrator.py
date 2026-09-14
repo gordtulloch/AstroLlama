@@ -29,6 +29,37 @@ _LLM_PREVIEW_LEN = 500  # chars of preview sent to the LLM
 
 _MAX_TOOL_ITERATIONS = 10
 
+# Tools that physically control hardware — only expose them when the user
+# explicitly requests a hardware action (slew, image, connect, etc.).
+_HARDWARE_TOOL_PREFIXES = (
+    "alpaca_",
+    "indi_",
+    "telescope_",
+    "register_telescope",
+    "astap_",
+    "orchestrate",  # planning tool — only valid alongside explicit hardware actions
+)
+_HARDWARE_ACTION_RE = re.compile(
+    r"\b(slew|move|point|go\s+to|connect|disconnect|image|capture|exposure|"
+    r"plate.?solve|platesolve|focus|park|home|track|register|discover|"
+    r"alpaca|indi|mount|telescope\s+(is|to|at|on|go|move|slew|connect|start|stop))\b",
+    re.IGNORECASE,
+)
+
+
+def _filter_tools_for_query(tools: list[dict[str, Any]], user_text: str) -> list[dict[str, Any]]:
+    """Strip hardware-control tools unless the query explicitly requests a hardware action."""
+    if _HARDWARE_ACTION_RE.search(user_text):
+        return tools
+    return [
+        t for t in tools
+        if not any(
+            (t.get("function") or {}).get("name", "").startswith(p)
+            or (t.get("function") or {}).get("name", "") == p.rstrip("_")
+            for p in _HARDWARE_TOOL_PREFIXES
+        )
+    ]
+
 _ASR_DISAMBIGUATION_HINT = (
     "\n\nVOICE TRANSCRIPTION DISAMBIGUATION POLICY:\n"
     "- Users may be speaking via browser speech recognition; occasional mistranscriptions are expected.\n"
@@ -823,6 +854,7 @@ async def run_chat(
       {"type": "error",       "message": "..."}
     """
     tools = mcp_client.tools if mcp_client.available else []
+    tools = mcp_client.tools if mcp_client.available else []
     web_search_tool = _find_tool_name(tools, ["search_web", "web_search"])
     scrape_website_tool = _find_tool_name(tools, ["scrape_website"])
     emit_tool_events = not settings.hide_tool_bubbles
@@ -851,6 +883,8 @@ async def run_chat(
         if msg.get("role") == "user":
             last_user_text = str(msg.get("content") or "")
             break
+    # Strip hardware-control tools unless the query explicitly requests a hardware action.
+    tools = _filter_tools_for_query(tools, last_user_text)
     website_intent = bool(_WEBSITE_INTENT_RE.search(last_user_text or ""))
 
     location_query = _extract_location_for_latlong_query(last_user_text)
@@ -1042,8 +1076,9 @@ async def run_chat(
         tool_policy = (
             "\n\nTOOL USE POLICY (follow strictly):\n"
             "1. Answer from your own training knowledge. If you know the answer, say it directly.\n"
-            "2. If RAG context was injected above, use it to supplement your answer.\n"
+            "2. If RAG context was injected above, answer directly from it. Do NOT call any tool.\n"
             "3. Do NOT call any tool simply because the topic is astronomical or because you are uncertain.\n"
+            "   - Telescope/Alpaca/INDI tools are ONLY for controlling physical telescope hardware. NEVER call them for informational or knowledge questions.\n"
             f"3a. If no local RAG context was injected, or a specialized lookup tool returns no useful results, call {web_search_tool or 'search_web'} once as a fallback for informational web lookup.\n"
             "4. Never call orchestrate for a single direct action that one tool can execute immediately.\n"
             "   - Example: 'Move the telescope to M45 and take a 10 second exposure' should call alpaca_slew_and_capture directly.\n"
@@ -1117,8 +1152,9 @@ async def run_chat(
                 clean_chunks = [c for c in clean_chunks if c]
                 context_text = "\n\n---\n\n".join(clean_chunks)
                 rag_addition = (
-                    "\n\nThe following context was retrieved from the local knowledge base. "
-                    "Use it to help answer the question.\n\n"
+                    "\n\nRAG CONTEXT (answer from this — do NOT call any tool for this question):\n"
+                    "The following was retrieved from the local knowledge base. "
+                    "Use it to answer the question directly.\n\n"
                     f"{context_text}"
                 )
 
@@ -1134,6 +1170,10 @@ async def run_chat(
 
                 logger.debug("RAG: injected %d chunk(s) into context", len(chunks))
                 rag_context_injected = True
+                # Strip all tools — the model must answer from the injected context.
+                tools = []
+            else:
+                logger.info("RAG: query returned no chunks for: %r", query_text[:120])
 
     if web_search_tool and not rag_context_injected and llm_messages and llm_messages[0].get("role") == "system":
         llm_messages[0] = {
